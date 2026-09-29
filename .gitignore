@@ -1,0 +1,44 @@
+# Local workbench output and installed toolchain
+.work/
+.tools/
+
+# Python and test artifacts
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# JavaScript dependencies and test output
+node_modules/
+test-results/
+
+# FPGA builds and simulation output
+build/
+dist/
+obj_dir/
+.Xil/
+*.runs/
+*.cache/
+*.gen/
+*.sim/
+*.hw/
+*.ip_user_files/
+*.bit
+*.dcp
+*.fasm
+*.frames
+*.vvp
+*.vcd
+*.fst
+*.wdb
+*.jou
+*.log
+*.rpt
+
+# Editor and OS temporary files
+*.swp
+*~
+.DS_Store

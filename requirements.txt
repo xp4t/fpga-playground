@@ -1,0 +1,3 @@
+# The workbench server itself uses only Python's standard library.
+# Include the pinned Python dependencies for the optional Basys 3 fabric decoder.
+-r ../virtual-basys3/bitstream-decode/requirements.txt
