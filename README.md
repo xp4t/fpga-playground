@@ -10,6 +10,17 @@ Keep this directory next to `~/virtual-basys3`, as in this workspace. Install `y
 python3 server.py
 ```
 
+For the optional Basys 3 bitstream decoder, install the Python dependencies in a Python 3.9 environment:
+
+```sh
+conda create -n fpga-playground python=3.9 pip
+conda activate fpga-playground
+python -m pip install -r requirements.txt
+python server.py
+```
+
+The pinned FPGA Interchange dependency requires `pycapnp==1.1.0`. That release and the pinned `fasm` release provide Linux x86-64 wheels for Python 3.9, but not Python 3.13. Installing with the Python 3.13 Conda base environment tries to compile the older `pycapnp` source and fails during Cython compilation.
+
 Open <http://127.0.0.1:8000>. The default counter is ready to edit. **Synthesize** runs Yosys. **Implement** asks for a switch word sized to the selected board, starts an Icarus Verilog RTL simulation for the board and waveform, then places and routes the design when an Artix-7 backend is installed. The virtual board can then be stepped, run, and controlled with switches and pushbuttons. The switch word sets simulated input pins; it is not baked into the bitstream. Changing boards clears the current build artifacts but keeps the editor source.
 
 The local preview records up to 4096 clock cycles per implementation. Choose **Implement** again to restart the capture with a new switch word. The waveform panel can export its samples as CSV.
