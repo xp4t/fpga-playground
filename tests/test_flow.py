@@ -1,5 +1,7 @@
 """End-to-end tool checks for the local FPGA workbench."""
 
+import importlib.util
+import os
 import shutil
 import tempfile
 import unittest
@@ -7,6 +9,27 @@ from pathlib import Path
 from unittest import mock
 
 import server
+
+
+class LocalResourceTests(unittest.TestCase):
+    def test_basys_assets_are_in_this_repository(self):
+        self.assertEqual(server.BOARDS["basys3"]["xdc"],
+                         server.ROOT / "boards/Basys-3-Master.xdc")
+        self.assertTrue(server.BOARDS["basys3"]["xdc"].is_file())
+        self.assertTrue((server.ROOT / "web/basys3.jpg").is_file())
+
+    def test_decoder_accepts_a_standalone_database(self):
+        module_path = server.ROOT / "bitstream-decode/pipeline.py"
+        spec = importlib.util.spec_from_file_location("local_pipeline", module_path)
+        pipeline = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(pipeline)
+        with tempfile.TemporaryDirectory() as directory:
+            part = Path(directory) / "xc7a35tcpg236-1"
+            part.mkdir()
+            (part / "part.json").touch()
+            (part / "package_pins.csv").touch()
+            with mock.patch.dict(os.environ, {"PRJXRAY_DB_ROOT": directory}):
+                self.assertEqual(pipeline.database_root(), Path(directory))
 
 
 @unittest.skipUnless(all(shutil.which(name) for name in ("yosys", "iverilog", "vvp")),

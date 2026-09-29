@@ -15,7 +15,6 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parent
-REFERENCE = Path(__file__).resolve().parent.parent / "virtual-basys3"
 WORK = ROOT / ".work"
 MAX_SOURCE = 100_000
 MAX_PREVIEW_CYCLES = 4096
@@ -24,7 +23,7 @@ BUTTONS = ("btnC", "btnU", "btnD", "btnL", "btnR")
 BOARDS = {
     "basys3": {"name": "Basys 3", "part": "xc7a35tcpg236-1", "device": "xc7a35tcpg236",
                "switches": 16, "leds": 16, "buttons": BUTTONS,
-               "xdc": REFERENCE / "references/Basys-3-Master.xdc"},
+               "xdc": ROOT / "boards/Basys-3-Master.xdc"},
     "nexys_a7_100t": {"name": "Nexys A7 100T", "part": "xc7a100tcsg324-1",
                         "device": "xc7a100tcsg324", "switches": 16, "leds": 16,
                         "buttons": BUTTONS, "xdc": ROOT / "boards/Nexys-A7-100T-Master.xdc"},
@@ -703,10 +702,10 @@ endmodule
         try:
             if importlib.util.find_spec("fasm") is None or importlib.util.find_spec("fasm2bels") is None:
                 raise ModuleNotFoundError(
-                    "Basys 3 decoder needs fasm and fasm2bels. Start the server with "
-                    f"{REFERENCE / '.venv/bin/python'} server.py")
-            for name in ("sim-core", "bitstream-decode", "board-visualizer"):
-                path = str(REFERENCE / name)
+                    "Basys 3 decoder needs fasm and fasm2bels. Install requirements.txt "
+                    "in the Python environment running this server")
+            for name in ("sim-core", "bitstream-decode"):
+                path = str(ROOT / name)
                 if path not in sys.path:
                     sys.path.insert(0, path)
             from runtime import BoardRuntime
@@ -792,7 +791,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_data({"error": "Artifact not found"}, status=404)
             return
         if path == "/basys3.jpg":
-            self.send_data((REFERENCE / "basys3.jpg").read_bytes(), "image/jpeg")
+            self.send_data((ROOT / "web/basys3.jpg").read_bytes(), "image/jpeg")
             return
         if path in ("/artya7.png", "/nexysa7.avif"):
             file = ROOT / path.lstrip("/")
@@ -859,16 +858,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    # The adjacent virtual-basys3 decoder launches its stages with sys.executable.
-    # Use its prepared environment even when this server was started with python3.
-    if importlib.util.find_spec("fasm") is None or importlib.util.find_spec("fasm2bels") is None:
-        decoder_python = REFERENCE / ".venv/bin/python"
-        if decoder_python.is_file() and decoder_python != Path(sys.executable):
-            check = subprocess.run([str(decoder_python), "-c", "import fasm, fasm2bels"],
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                   timeout=15, check=False)
-            if check.returncode == 0:
-                os.execv(str(decoder_python), [str(decoder_python), str(Path(__file__).resolve()), *sys.argv[1:]])
     LAB = Lab()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
