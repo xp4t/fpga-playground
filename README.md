@@ -1,13 +1,20 @@
 # FPGA Workbench
 
-A browser workbench for editing Verilog, synthesizing it, choosing virtual switch inputs, viewing LEDs and waveforms, and generating an Artix-7 `.bit` with the open XC7 toolchain or Vivado. Select Basys 3, Nexys A7 100T, or Arty A7 100T in the header. The Basys 3 fabric model comes from [virtual-basys3](https://github.com/xp4t/virtual-basys3).
+A browser workbench for editing Verilog, synthesizing it, choosing virtual switch inputs, viewing LEDs and waveforms, and generating an Artix-7 `.bit` with the open XC7 toolchain or Vivado. Select Basys 3, Nexys A7 100T, or Arty A7 100T in the header. The Basys 3 fabric model is included here and comes from [virtual-basys3](https://github.com/xp4t/virtual-basys3).
 
 ## Run locally
 
-Keep this directory next to `~/virtual-basys3`, as in this workspace. Install `yosys`, `iverilog`, and `vvp` on your path. Then run:
+Install `yosys`, `iverilog`, and `vvp` on your path. For Basys 3 bitstream decoding, also install the Python dependencies into a local environment:
 
 ```sh
-python3 server.py
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+Then run:
+
+```sh
+.venv/bin/python server.py
 ```
 
 Open <http://127.0.0.1:8000>. The default counter is ready to edit. **Synthesize** runs Yosys. **Implement** asks for a switch word sized to the selected board, starts an Icarus Verilog RTL simulation for the board and waveform, then places and routes the design when an Artix-7 backend is installed. The virtual board can then be stepped, run, and controlled with switches and pushbuttons. The switch word sets simulated input pins; it is not baked into the bitstream. Changing boards clears the current build artifacts but keeps the editor source.
@@ -28,13 +35,9 @@ The installer writes to `.tools/openxc7`, which is excluded from version control
 
 With open XC7 installed, **Synthesize** maps the board design with Yosys `synth_xilinx`. **Implement** invokes `nextpnr-xilinx` to produce `routed.json` and `design.fasm`. **Generate .bit** uses `fasm2frames` and `xc7frames2bit` to produce the downloadable `design.bit`. The build artifacts include each intermediate file so you can inspect the actual output of every stage. Without an Artix-7 backend, Implement runs the RTL preview and the interface reports that bitstream generation is unavailable.
 
-Alternatively, install Vivado with support for `xc7a35tcpg236-1` and `xc7a100tcsg324-1` and put `vivado` on `PATH`, or set `VIVADO_BIN` to its executable. Vivado takes precedence when both backends are installed. The Basys 3 bitstream decoder needs `fasm` and `fasm2bels`. When launched with `python3 server.py`, the server automatically restarts in the adjacent `virtual-basys3` environment if those packages are present there. You can also start it directly with:
+Alternatively, install Vivado with support for `xc7a35tcpg236-1` and `xc7a100tcsg324-1` and put `vivado` on `PATH`, or set `VIVADO_BIN` to its executable. Vivado takes precedence when both backends are installed. The Basys 3 bitstream decoder uses the Python packages in `requirements.txt` and the Artix-7 Project X-Ray database shipped with the open XC7 toolchain. If you use Vivado without installing open XC7, set `PRJXRAY_DB_ROOT` to a compatible Artix-7 database directory containing `xc7a35tcpg236-1/part.json` and `package_pins.csv`.
 
-```sh
-~/virtual-basys3/.venv/bin/python server.py
-```
-
-The `virtual-basys3` bitstream decoder is hardwired to the Basys 3 part and pins. On Basys 3 at 100 MHz, a supported `.bit` drives the virtual board and captured pin waveform; unsupported blocks show a decoder error while the RTL preview remains available. At lower clock settings, the real `.bit` contains the divider, but the board LEDs and waveform show RTL simulation of selected clock cycles because advancing millions of 100 MHz source cycles in the decoded fabric is impractical. On Nexys A7 100T and Arty A7 100T, the generated `.bit` is real and downloadable, while the board LEDs and waveform continue to show RTL simulation. The interface labels these cases.
+The included `virtual-basys3` bitstream decoder is hardwired to the Basys 3 part and pins. On Basys 3 at 100 MHz, a supported `.bit` drives the virtual board and captured pin waveform; unsupported blocks show a decoder error while the RTL preview remains available. At lower clock settings, the real `.bit` contains the divider, but the board LEDs and waveform show RTL simulation of selected clock cycles because advancing millions of 100 MHz source cycles in the decoded fabric is impractical. On Nexys A7 100T and Arty A7 100T, the generated `.bit` is real and downloadable, while the board LEDs and waveform continue to show RTL simulation. The interface labels these cases.
 
 ### Open source tool authors
 
@@ -57,7 +60,7 @@ Small modules with arbitrary port names map input bits to switches and output bi
 
 | Board | FPGA part | Switches / LEDs | Buttons | Pin source |
 | --- | --- | --- | --- | --- |
-| Basys 3 | `xc7a35tcpg236-1` | 16 / 16 | `btnC`, `btnU`, `btnD`, `btnL`, `btnR` | [Basys 3 master XDC](https://github.com/Digilent/digilent-xdc/blob/master/Basys-3-Master.xdc) in `virtual-basys3` |
+| Basys 3 | `xc7a35tcpg236-1` | 16 / 16 | `btnC`, `btnU`, `btnD`, `btnL`, `btnR` | [Basys 3 master XDC](boards/Basys-3-Master.xdc) |
 | Nexys A7 **100T** | `xc7a100tcsg324-1` | 16 / 16 | Same five names | [Digilent Nexys A7 100T XDC](https://github.com/Digilent/digilent-xdc/blob/master/Nexys-A7-100T-Master.xdc) |
 | Arty A7 **100T** | `xc7a100tcsg324-1` | 4 / 4 | `btnC`→BTN0, `btnU`→BTN1, `btnD`→BTN2, `btnL`→BTN3; or native `btn[3:0]` | [Digilent Arty A7 100 XDC](https://github.com/Digilent/digilent-xdc/blob/master/Arty-A7-100-Master.xdc) |
 
