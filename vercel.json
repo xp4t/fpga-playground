@@ -1,0 +1,7 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "installCommand": "",
+  "buildCommand": "mkdir -p dist && cp -r web/. dist/ && cp artya7.png nexysa7.avif dist/",
+  "outputDirectory": "dist"
+}
