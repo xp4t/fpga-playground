@@ -8,6 +8,31 @@ let activeButton = null;
 let controlQueue = Promise.resolve();
 let topAuto = true;
 let clockSelectionHz = 100000000;
+let backendOffline = false;
+let checkingBackend = false;
+
+async function checkBackend() {
+  if (checkingBackend) return;
+  checkingBackend = true;
+  $('retry-backend').disabled = true;
+  try {
+    const response = await fetch('/healthz', {cache: 'no-store', signal: AbortSignal.timeout(7000)});
+    if (!response.ok || !(await response.json()).ok) throw new Error('Server unavailable');
+    if (backendOffline || !state) await loadWorkbench(true);
+    backendOffline = false;
+  } catch {
+    backendOffline = true;
+    running = false;
+    clearInterval(timer);
+    timer = null;
+    $('build-status').textContent = 'Server offline';
+  } finally {
+    $('backend-offline').hidden = !backendOffline;
+    $('retry-backend').disabled = false;
+    checkingBackend = false;
+    renderControls();
+  }
+}
 
 const boardPositions = {
   basys3: {
@@ -164,7 +189,7 @@ async function api(path, payload) {
 }
 
 async function action(path, payload) {
-  if (busy) return false;
+  if (busy || backendOffline) return false;
   busy = true;
   renderControls();
   const progress = {'/api/synthesize':'Synthesizing Verilog…','/api/implement':'Placing, routing, and preparing board…','/api/bitstream':'Generating Artix-7 bitstream…'}[path];
@@ -187,8 +212,10 @@ async function action(path, payload) {
 }
 
 function control(payload) {
+  if (backendOffline) return;
   if (!state?.preview) { showNotice('Synthesize, then choose switches with Implement to start the board preview.'); return; }
   controlQueue = controlQueue.then(async () => {
+    if (backendOffline) return;
     state = await api('/api/control', typeof payload === 'function' ? payload() : payload);
     render();
   }).catch(error => { stopRun(); showNotice(error.message); });
@@ -230,14 +257,15 @@ function toggleRun() {
 }
 
 function renderControls() {
+  const unavailable = busy || backendOffline;
   const synthesized = ['synthesized','preview','implemented','bitstream'].includes(state?.phase);
-  $('board-select').disabled = busy;
-  $('synthesize-button').disabled = busy;
-  $('implement-button').disabled = busy || !synthesized || sourceDirty;
-  $('bitstream-button').disabled = busy || !['implemented','bitstream'].includes(state?.phase) || sourceDirty;
-  $('run-button').disabled = busy || !state?.preview;
-  $('step-button').disabled = busy || !state?.preview;
-  $('reset-button').disabled = busy || !state?.preview || !state?.boardButtons?.includes('btnC');
+  $('board-select').disabled = unavailable;
+  $('synthesize-button').disabled = unavailable;
+  $('implement-button').disabled = unavailable || !synthesized || sourceDirty;
+  $('bitstream-button').disabled = unavailable || !['implemented','bitstream'].includes(state?.phase) || sourceDirty;
+  $('run-button').disabled = unavailable || !state?.preview;
+  $('step-button').disabled = unavailable || !state?.preview;
+  $('reset-button').disabled = unavailable || !state?.preview || !state?.boardButtons?.includes('btnC');
   $('reset-button').title = state?.board === 'arty_a7_100t' ? 'Pulse Arty BTN0' : 'Pulse center pushbutton';
   $('run-button').innerHTML = running ? '<span aria-hidden="true">■</span> Pause' : '<span aria-hidden="true">▶</span> Run';
   $('editor-state').textContent = sourceDirty ? 'Unsynthesized changes' : 'Saved in this browser';
@@ -509,8 +537,27 @@ function renderDialogSwitches() {
   $('dialog-switches').innerHTML=Array.from({length:state.switchCount},(_,i)=>`<button type="button" data-bit="${i}" class="dialog-switch ${(value>>i)&1?'on':''}" aria-pressed="${Boolean((value>>i)&1)}"><span>${(value>>i)&1}</span><small>SW${i}</small></button>`).join('');
 }
 
+async function loadWorkbench(preserveEditor = false) {
+  const keepEdits = preserveEditor && (state !== null || $('editor').value.length > 0);
+  const [source,status]=await Promise.all([requestJSON('/api/source'),requestJSON('/api/status')]);
+  state=status;
+  if (!keepEdits) clockSelectionHz = state.clockHz || 100000000;
+  let saved;
+  try { saved=localStorage.getItem('fpga-workbench-code'); } catch {}
+  if (!keepEdits) {
+    $('editor').value=saved||source.code;
+    $('top-module').value=source.top;
+  }
+  suggestTop();
+  sourceDirty=$('editor').value!==source.code || clockSelectionHz !== state.clockHz;
+  updateLines();
+  render();
+}
+
 async function init() {
   setupEditor();
+  $('retry-backend').addEventListener('click', checkBackend);
+  setInterval(checkBackend, 30000);
   $('switch-grid').addEventListener('click', (event) => {
     const button = event.target.closest('[data-switch]');
     if (button) toggleSwitch(Number(button.dataset.switch));
@@ -519,25 +566,16 @@ async function init() {
     await control({button:'btnC',value:true});
     await control({button:'btnC',value:false});
   });
-  const [source,status]=await Promise.all([requestJSON('/api/source'),requestJSON('/api/status')]);
-  state=status;
-  clockSelectionHz = state.clockHz || 100000000;
-  let saved;
-  try { saved=localStorage.getItem('fpga-workbench-code'); } catch {}
-  $('editor').value=saved||source.code;
-  $('top-module').value=source.top;
-  suggestTop();
-  sourceDirty=Boolean(saved && saved!==source.code);
-  updateLines();
-  render();
   setInterval(async () => {
-    if (busy || running || !state?.fabricStatus || state.fabricStatus==='error') return;
+    if (busy || backendOffline || running || !state?.fabricStatus || state.fabricStatus==='error') return;
     try { state=await requestJSON('/api/status'); render(); } catch {}
   }, 900);
+  await loadWorkbench();
 }
 
 init().catch(error => {
   $('build-status').textContent = 'Backend unavailable';
   $('build-log').textContent = error.message;
   showNotice(`Unable to connect to the workbench: ${error.message}`);
+  checkBackend();
 });

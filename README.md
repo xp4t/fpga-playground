@@ -36,7 +36,7 @@ The board clock input is 100 MHz. The **Clock** control offers 100, 50, and 25 M
 
 ## Connect a Vercel frontend to a backend
 
-`vercel.json` deploys the static frontend only. Until an API route is configured,
+`vercel.json` deploys the frontend and a small Node.js availability function. Until an API route is configured,
 `/api/source` and `/api/status` return a Vercel error page instead of JSON.
 The interface reports that the backend is not connected.
 
@@ -54,19 +54,17 @@ It does not install open XC7, Vivado, or the optional bitstream decoder.
    Multiple exact origins can be separated by commas. Add preview deployment
    origins explicitly when needed. This is origin validation, not authentication.
 4. Keep the Docker command unchanged; it binds to `0.0.0.0` and honors Render's
-   `PORT` environment variable. Use `/api/status` as the health check path.
+   `PORT` environment variable. Use `/api/health` as the health check path.
 5. Wait for the service to deploy. Open
    `https://YOUR-SERVICE.onrender.com/api/status` and confirm it returns JSON.
-6. Add this top-level property to the existing `vercel.json`, retaining its build
-   and installation settings, replace the hostname, and push to redeploy Vercel:
+6. Update only the external API destination in the existing `vercel.json`,
+   retaining the other rewrites and settings, then push to redeploy Vercel:
 
 ```json
-"rewrites": [
-  {
-    "source": "/api/:path*",
-    "destination": "https://YOUR-SERVICE.onrender.com/api/:path*"
-  }
-]
+{
+  "source": "/api/:path*",
+  "destination": "https://YOUR-SERVICE.onrender.com/api/:path*"
+}
 ```
 
 The browser continues to call its own `/api` paths, including artifact downloads;
@@ -116,6 +114,28 @@ The build endpoints are currently synchronous and can run for many minutes.
 Reliable long builds require a background job API that returns a job ID promptly,
 with a worker performing builds and the frontend polling progress. Changing the
 backend hostname alone does not solve this timeout.
+
+### When the backend PC is offline
+
+Vercel checks the lightweight `/api/health` endpoint before serving the homepage.
+If the PC, server, or tunnel is unavailable (including a four-second timeout),
+the homepage returns **HTTP 503 Service Unavailable**, with `Retry-After: 30`
+and an offline page hosted on Vercel. The page retries every 30 seconds and
+automatically opens the workbench when the server returns. `/healthz` exposes
+the same availability check as JSON. Responses are not cached.
+
+Already-open workbenches check every 30 seconds, pause playback and disable builds
+during an outage, and keep the editor available. Reconnecting refreshes backend
+state while preserving the editor contents. Health checks do not acquire the
+build lock, so a long build does not itself mean the PC is offline.
+
+Keep the homepage and `/healthz` rewrites before the external API rewrite.
+The availability function reads the backend hostname from that API rewrite;
+update it and redeploy when a Quick Tunnel hostname changes. Restart `server.py`
+after updating it to enable `/api/health`.
+
+Verify outage handling with `node --test tests/test_availability.cjs` and
+`python3 -m unittest discover -s tests -p test_health.py -v`.
 
 To verify the connection handling, run `node tests/test_api.cjs` and
 `python3 -m unittest discover -s tests -p test_http.py -v`.

@@ -29,6 +29,15 @@ h1, h2, h3, p { margin: 0; }
 ::selection { background: #bcd8f8; color: #10283d; }
 :focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
 [hidden] { display: none !important; }
+.unavailable-content { max-width: 620px; margin: clamp(56px, 12vh, 140px) auto; padding: 0 24px; }
+.unavailable-code { color: #925710; font: 600 12px/1.5 var(--mono); letter-spacing: .04em; }
+.unavailable-content h1 { margin: 20px 0 16px; font-size: clamp(28px, 5vw, 38px); line-height: 1.15; letter-spacing: -.025em; }
+.unavailable-content p:not(.unavailable-code) { color: var(--muted); font-size: 16px; line-height: 1.65; }
+.unavailable-content .button { margin-top: 28px; min-height: 44px; }
+.unavailable-content .unavailable-status { margin-top: 16px; font-size: 13px !important; }
+.offline-banner { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 16px; padding: 18px 24px; background: #fff4df; border-bottom: 1px solid #dfcba5; }
+.offline-banner p { margin-top: 4px; color: var(--muted); }
+.offline-banner .button { min-height: 44px; }
 .topbar {
   min-height: 78px; padding: 0 36px; display: flex; align-items: center; gap: 26px;
   background: var(--surface); border-bottom: 1px solid var(--line);

@@ -4,7 +4,17 @@
   "installCommand": "",
   "buildCommand": "mkdir -p dist && cp -r web/. dist/ && cp artya7.png nexysa7.avif dist/",
   "outputDirectory": "dist",
+  "functions": {
+    "api/availability.js": {
+      "includeFiles": "{web/index.html,web/503.html,vercel.json}",
+      "maxDuration": 10
+    }
+  },
   "rewrites": [
+    { "source": "/", "destination": "/api/availability" },
+    { "source": "/index.html", "destination": "/api/availability" },
+    { "source": "/healthz", "destination": "/api/availability?check=1" },
+    { "source": "/api/availability", "destination": "/api/availability" },
     {
       "source": "/api/:path*",
       "destination": "https://kelkoo-clara-mac-sort.trycloudflare.com/api/:path*"

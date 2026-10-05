@@ -827,6 +827,10 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         path = urlsplit(self.path).path
+        if path in ("/api/health", "/healthz"):
+            # Builds hold LAB.lock; a health check must remain responsive during them.
+            self.send_data({"ok": True})
+            return
         if path == "/api/status":
             with LAB.lock:
                 self.send_data(LAB.snapshot())
