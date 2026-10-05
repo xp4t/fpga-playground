@@ -34,6 +34,92 @@ The local preview records up to 4096 clock cycles per implementation. Choose **I
 
 The board clock input is 100 MHz. The **Clock** control offers 100, 50, and 25 MHz presets and a logarithmic slider from 25 MHz down to 1 Hz. For a design with a `clk` input, lower settings synthesize a counter divider into the bitstream. Some slider values round to the nearest rate achievable by an integer divider; the interface shows that actual rate. Changing the clock requires **Synthesize**, **Implement**, and **Generate .bit** again. The RTL preview advances one selected clock edge per sample; browser playback runs at the selected rate up to 20 cycles per second, rather than trying to animate millions of cycles per second. A design without `clk` has no clock to divide.
 
+## Connect a Vercel frontend to a backend
+
+`vercel.json` deploys the static frontend only. Until an API route is configured,
+`/api/source` and `/api/status` return a Vercel error page instead of JSON.
+The interface reports that the backend is not connected.
+
+### Free hosted RTL preview on Render
+
+The included `Dockerfile` installs Python, Yosys, and Icarus Verilog and runs as
+an unprivileged user. It supports synthesis, board simulation, and waveforms.
+It does not install open XC7, Vivado, or the optional bitstream decoder.
+
+1. Push the updated repository to GitHub.
+2. On Render, create a **Web Service**, connect the repository, choose the
+   **Docker** runtime, use the repository root and `Dockerfile`, and select **Free**.
+3. Add the backend environment variable
+   `ALLOWED_ORIGINS=https://fpga-playground.vercel.app`.
+   Multiple exact origins can be separated by commas. Add preview deployment
+   origins explicitly when needed. This is origin validation, not authentication.
+4. Keep the Docker command unchanged; it binds to `0.0.0.0` and honors Render's
+   `PORT` environment variable. Use `/api/status` as the health check path.
+5. Wait for the service to deploy. Open
+   `https://YOUR-SERVICE.onrender.com/api/status` and confirm it returns JSON.
+6. Add this top-level property to the existing `vercel.json`, retaining its build
+   and installation settings, replace the hostname, and push to redeploy Vercel:
+
+```json
+"rewrites": [
+  {
+    "source": "/api/:path*",
+    "destination": "https://YOUR-SERVICE.onrender.com/api/:path*"
+  }
+]
+```
+
+The browser continues to call its own `/api` paths, including artifact downloads;
+Vercel forwards them to Render. This workflow does not require browser CORS
+headers. `ALLOWED_ORIGINS` allows the original frontend origin on proxied POSTs.
+Open the Vercel site's `/api/status` after redeployment and confirm it returns JSON.
+
+[Render's free services](https://render.com/docs/free) sleep after 15 minutes of
+inactivity and lose generated files and in-memory state on restart, redeploy, or
+sleep. The [free compute plan](https://render.com/docs/compute-plans) provides
+512 MB RAM and 0.1 CPU. Use this setup for small, temporary RTL demonstrations;
+it is not a suitable default for Artix-7 placement and routing.
+
+### Full FPGA tools on your Linux x86-64 computer
+
+For development, an existing Linux computer can provide the backend compute.
+Install `yosys` and `iverilog`, optionally run `./scripts/install_openxc7.sh` for
+bitstream builds, and start the updated backend:
+
+```sh
+ALLOWED_ORIGINS=https://fpga-playground.vercel.app \
+  python3 server.py --host 127.0.0.1 --port 8000
+```
+
+After installing the open source
+[`cloudflared` client](https://github.com/cloudflare/cloudflared), a temporary
+[Quick Tunnel](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/)
+can expose this local server over HTTPS for testing:
+
+```sh
+cloudflared tunnel --url http://127.0.0.1:8000
+```
+
+Use the printed `https://...trycloudflare.com` hostname as the rewrite destination,
+retaining `/api/:path*`. The machine, server, and tunnel must remain running.
+Quick Tunnel hostnames change whenever the tunnel restarts. For a stable address,
+configure a named tunnel with a domain you control or a Linux server with HTTPS.
+
+Both deployment examples currently expose a single shared workbench, not separate
+user projects. Run the HDL tools in an isolated environment and add authentication
+before opening the service for public submissions. The Docker image isolates
+files from the host, but does not add user authentication, per-job resource limits,
+or separate workspaces for visitors.
+
+The build endpoints are currently synchronous and can run for many minutes.
+[Vercel external rewrites](https://vercel.com/docs/limits) time out after 120 seconds.
+Reliable long builds require a background job API that returns a job ID promptly,
+with a worker performing builds and the frontend polling progress. Changing the
+backend hostname alone does not solve this timeout.
+
+To verify the connection handling, run `node tests/test_api.cjs` and
+`python3 -m unittest discover -s tests -p test_http.py -v`.
+
 ## Generate a board bitstream
 
 On Linux x86-64, install the [open XC7 toolchain](https://github.com/FPGAwars/tools-openxc7) and matching databases for both FPGA parts with:

@@ -552,7 +552,66 @@ class Lab:
                            if (WORK / name).is_file())
         script = (f"read_verilog -sv {sources}; synth_xilinx -family xc7 "
                   f"-top {self.build_top}; write_json xc7_netlist.json; stat")
-        return run([tool_path("yosys"), "-Q", "-T", "-p", script], timeout=900)
+        output = run([tool_path("yosys"), "-Q", "-T", "-p", script], timeout=900)
+        self.materialize_xc7_constants()
+        return output
+
+    def materialize_xc7_constants(self):
+        """Work around an open XC7 packer crash on literal JSON net bits.
+
+        Some nextpnr-xilinx builds segfault while packing a design containing
+        raw ``0``/``1`` net literals (the normal Yosys JSON representation for
+        constants).  Explicit LUT1 cells implement the same constants and are
+        accepted by those builds.  The LUT input is an otherwise unused live
+        input net, so the cell remains in the mapped netlist while its output
+        stays constant for every input value.
+        """
+        netlist_path = WORK / "xc7_netlist.json"
+        design = json.loads(netlist_path.read_text())
+        changed = False
+        for module in design.get("modules", {}).values():
+            if not module.get("cells"):
+                continue
+            input_bits = [bit for port in module.get("ports", {}).values()
+                          if port.get("direction") == "input"
+                          for bit in port.get("bits", []) if isinstance(bit, int)]
+            if not input_bits:
+                continue
+            source_bit = input_bits[0]
+            all_bits = [bit for port in module.get("ports", {}).values()
+                        for bit in port.get("bits", []) if isinstance(bit, int)]
+            for cell in module.get("cells", {}).values():
+                for bits in cell.get("connections", {}).values():
+                    all_bits.extend(bit for bit in bits if isinstance(bit, int))
+            next_bit = max(all_bits, default=0) + 1
+            fixes = []
+
+            def replacement(bit):
+                nonlocal next_bit
+                if bit not in ("0", "1"):
+                    return bit
+                net = next_bit
+                next_bit += 1
+                fixes.append({
+                    "hide_name": 1,
+                    "type": "LUT1",
+                    "parameters": {"INIT": 0 if bit == "0" else 3},
+                    "attributes": {"module_not_derived": 1},
+                    "port_directions": {"I0": "input", "O": "output"},
+                    "connections": {"I0": [source_bit], "O": [net]},
+                })
+                return net
+
+            for port in module.get("ports", {}).values():
+                port["bits"] = [replacement(bit) for bit in port.get("bits", [])]
+            for cell in list(module.get("cells", {}).values()):
+                for name, bits in cell.get("connections", {}).items():
+                    cell["connections"][name] = [replacement(bit) for bit in bits]
+            for index, cell in enumerate(fixes):
+                module.setdefault("cells", {})[f"$xc7_const_fix${index}"] = cell
+            changed = changed or bool(fixes)
+        if changed:
+            netlist_path.write_text(json.dumps(design))
 
     def compile_preview(self):
         if not tool_path("iverilog") or not tool_path("vvp"):
@@ -813,7 +872,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_data({"error": "Not found"}, status=404)
             return
         origin = self.headers.get("Origin")
-        if origin and urlsplit(origin).netloc != self.headers.get("Host"):
+        allowed_origins = {value.strip().rstrip("/") for value in
+                           os.environ.get("ALLOWED_ORIGINS", "").split(",") if value.strip()}
+        if (origin and urlsplit(origin).netloc != self.headers.get("Host")
+                and origin not in allowed_origins):
             self.send_data({"error": "Cross-origin request rejected"}, status=403)
             return
         try:
