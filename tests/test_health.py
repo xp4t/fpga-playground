@@ -18,8 +18,8 @@ class HealthTests(unittest.TestCase):
         for path in ("/api/health", "/healthz"):
             with self.subTest(path=path):
                 output = bytearray()
-                # No lock or snapshot exists: accessing either makes this fail.
-                with mock.patch.object(server, 'LAB', SimpleNamespace()):
+                # No session methods exist: health must not create or inspect a lab.
+                with mock.patch.object(server, 'SESSIONS', SimpleNamespace()):
                     server.Handler(Connection(), ('127.0.0.1', 12345), SimpleNamespace())
                 headers, body = bytes(output).split(b'\r\n\r\n', 1)
                 self.assertIn(b'200 OK', headers)

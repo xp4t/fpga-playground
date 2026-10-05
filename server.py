@@ -2,6 +2,12 @@
 """Local browser workbench for Basys3 RTL, simulation, and Artix-7 builds."""
 
 import argparse
+from contextlib import contextmanager
+import hashlib
+from http.cookies import SimpleCookie, CookieError
+import secrets
+import tempfile
+import time
 import importlib.util
 import json
 import os
@@ -81,9 +87,9 @@ def openxc7_paths(board="basys3"):
     return None
 
 
-def run(command, cwd=None, timeout=120):
+def run(command, cwd, timeout=120):
     try:
-        result = subprocess.run(command, cwd=cwd or WORK, text=True, stdout=subprocess.PIPE,
+        result = subprocess.run(command, cwd=cwd, text=True, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, timeout=timeout, check=False)
     except subprocess.TimeoutExpired as error:
         raise ValueError(f"Tool timed out after {timeout}s: {command[0]}") from error
@@ -93,15 +99,15 @@ def run(command, cwd=None, timeout=120):
     return output
 
 
-def run_to_file(command, output_file, timeout=120):
+def run_to_file(command, output_file, cwd, timeout=120):
     try:
-        with (WORK / output_file).open("w") as destination:
-            result = subprocess.run(command, cwd=WORK, text=True, stdout=destination,
+        with (cwd / output_file).open("w") as destination:
+            result = subprocess.run(command, cwd=cwd, text=True, stdout=destination,
                                     stderr=subprocess.PIPE, timeout=timeout, check=False)
     except subprocess.TimeoutExpired as error:
         raise ValueError(f"Tool timed out after {timeout}s: {command[0]}") from error
     if result.returncode:
-        (WORK / output_file).unlink(missing_ok=True)
+        (cwd / output_file).unlink(missing_ok=True)
         raise ValueError(result.stderr[-12_000:].strip() or
                          f"{command[0]} exited with {result.returncode}")
     return result.stderr[-12_000:]
@@ -153,7 +159,7 @@ def xdc_port(board, port):
     raise ValueError(f"No {BOARDS[board]['name']} pin mapping for {port}")
 
 
-def make_constraints(ports, board="basys3"):
+def make_constraints(ports, board="basys3", *, work):
     config = BOARDS[board]
     lines = config["xdc"].read_text().splitlines()
     desired = set()
@@ -203,7 +209,7 @@ def make_constraints(ports, board="basys3"):
         raise ValueError(f"No {config['name']} pin mapping for " + ", ".join(sorted(missing)))
     if "clk" in ports:
         selected.append("create_clock -period 10.000 [get_ports clk]")
-    (WORK / "board.xdc").write_text("\n".join(selected) + "\n")
+    (work / "board.xdc").write_text("\n".join(selected) + "\n")
 
 
 def clock_divider(clock_hz):
@@ -216,11 +222,11 @@ def clock_divider(clock_hz):
     return half_period, BOARD_CLOCK_HZ / (2 * half_period)
 
 
-def prepare_clock_top(top, ports, clock_hz):
+def prepare_clock_top(top, ports, clock_hz, *, work):
     """Divide the 100 MHz board input before it reaches the user's clk port."""
     half_period, actual_hz = clock_divider(clock_hz)
     if half_period is None or "clk" not in ports:
-        (WORK / "clock_adapter.v").unlink(missing_ok=True)
+        (work / "clock_adapter.v").unlink(missing_ok=True)
         return top, actual_hz
     adapter = "virtual_clock_adapter"
     if top == adapter:
@@ -248,11 +254,11 @@ def prepare_clock_top(top, ports, clock_hz):
                "`ifdef FPGA_PREVIEW\nwire user_clk = clk;\n`else\n"
                f"{divider}\nwire user_clk = divided_clk;\n`endif\n"
                f"{top} design_instance (" + ", ".join(connections) + ");\nendmodule\n")
-    (WORK / "clock_adapter.v").write_text(wrapper)
+    (work / "clock_adapter.v").write_text(wrapper)
     return adapter, actual_hz
 
 
-def prepare_board_top(user_top, ports, board="basys3"):
+def prepare_board_top(user_top, ports, board="basys3", *, work):
     """Keep matching board ports, or wrap smaller designs onto switches and LEDs."""
     config = BOARDS[board]
     switch_count, led_count = config["switches"], config["leds"]
@@ -267,7 +273,7 @@ def prepare_board_top(user_top, ports, board="basys3"):
               ports.get("led", {}).get("direction") == "output" and
               all(name in allowed for name in ports))
     if native:
-        (WORK / "adapter.v").unlink(missing_ok=True)
+        (work / "adapter.v").unlink(missing_ok=True)
         return (user_top, ports,
                 f"Direct {config['name']} ports: sw[{switch_count-1}:0] → SW; "
                 f"led[{led_count-1}:0] → LD.")
@@ -347,7 +353,7 @@ def prepare_board_top(user_top, ports, board="basys3"):
                "\n".join(output_wires) + "\n" +
                f"{user_top} design_instance (" + ", ".join(connections) + ");\n" +
                "assign led = {" + ", ".join(pieces) + "};\nendmodule\n")
-    (WORK / "adapter.v").write_text(wrapper)
+    (work / "adapter.v").write_text(wrapper)
     board_ports = {"sw": {"bits": list(range(switch_count)), "direction": "input"},
                    "led": {"bits": list(range(led_count)), "direction": "output"}}
     if "input wire clk" in inputs:
@@ -361,24 +367,24 @@ def prepare_board_top(user_top, ports, board="basys3"):
     return adapter, board_ports, summary
 
 
-def write_vivado_scripts(top, board="basys3"):
+def write_vivado_scripts(top, board="basys3", *, work):
     part = BOARDS[board]["part"]
-    source = tcl_path(WORK / "design.v")
-    xdc = tcl_path(WORK / "board.xdc")
+    source = tcl_path(work / "design.v")
+    xdc = tcl_path(work / "board.xdc")
     base = f"create_project -in_memory -part {part}\nread_verilog -sv {source}\n"
     for name in ("adapter.v", "clock_adapter.v"):
-        if (WORK / name).is_file():
-            base += f"read_verilog {tcl_path(WORK / name)}\n"
-    (WORK / "synth.tcl").write_text(base + f"synth_design -top {top} -part {part}\n"
+        if (work / name).is_file():
+            base += f"read_verilog {tcl_path(work / name)}\n"
+    (work / "synth.tcl").write_text(base + f"synth_design -top {top} -part {part}\n"
                                       "write_checkpoint -force synth.dcp\nreport_utilization -file synth.rpt\nexit 0\n")
-    (WORK / "implement.tcl").write_text(
+    (work / "implement.tcl").write_text(
         "open_checkpoint synth.dcp\n" + f"read_xdc {xdc}\n"
         + "set_property CFGBVS VCCO [current_design]\n"
         + "set_property CONFIG_VOLTAGE 3.3 [current_design]\n"
         + "opt_design\nplace_design\nroute_design\n"
         + "write_checkpoint -force routed.dcp\n"
         + "report_timing_summary -file timing.rpt\nexit 0\n")
-    (WORK / "bitstream.tcl").write_text(
+    (work / "bitstream.tcl").write_text(
         "open_checkpoint routed.dcp\n"
         "set_property BITSTREAM.STARTUP.STARTUPCLK JtagClk [current_design]\n"
         "set_property BITSTREAM.GENERAL.COMPRESS FALSE [current_design]\n"
@@ -386,16 +392,17 @@ def write_vivado_scripts(top, board="basys3"):
 
 
 class Lab:
-    def __init__(self):
+    def __init__(self, work):
+        self.work = Path(work).resolve()
         self.board = "basys3"
         self.clock_hz = BOARD_CLOCK_HZ
         self.clock_actual_hz = BOARD_CLOCK_HZ
-        WORK.mkdir(exist_ok=True)
+        self.work.mkdir(parents=True, exist_ok=True, mode=0o700)
         for name in ("design.v", "adapter.v", "clock_adapter.v", "board.xdc", "netlist.json", "user_netlist.json",
                      "xc7_netlist.json", "routed.json", "design.fasm", "design.frames", "route.log",
                      "synth.rpt", "timing.rpt",
                      "routed.dcp", "synth.dcp", "design.bit", "sim.vvp", "tb.v", "stimulus.hex"):
-            (WORK / name).unlink(missing_ok=True)
+            (self.work / name).unlink(missing_ok=True)
         self.lock = threading.RLock()
         self.code = DEFAULT_CODE
         self.top = "counter"
@@ -413,6 +420,39 @@ class Lab:
         self.backend = None
         self.fabric = None
         self.fabric_armed = False
+
+    def run(self, command, timeout=120):
+        return run(self.sandbox_command(command), cwd=self.work, timeout=timeout)
+
+    def run_to_file(self, command, output_file, timeout=120):
+        return run_to_file(self.sandbox_command(command), output_file, cwd=self.work, timeout=timeout)
+
+    def sandbox_command(self, command):
+        # HDL can read files with `include/$readmemh/$fopen. Hide sibling workspaces
+        # and the legacy shared output before exposing only this session's files.
+        bwrap = shutil.which("bwrap")
+        if not bwrap:
+            raise ValueError("Bubblewrap (bwrap) is required to isolate FPGA builds")
+        args = [bwrap, "--die-with-parent", "--unshare-all", "--cap-drop", "ALL"]
+        # Start with an empty filesystem. Only public system/toolchain files and
+        # this lab's writable directory are visible, never host home or siblings.
+        roots = [Path(name) for name in ("/usr", "/bin", "/sbin", "/lib", "/lib64", "/etc")]
+        roots.append(Path(command[0]).resolve().parent.parent)
+        paths = openxc7_paths(self.board)
+        if paths:
+            roots.extend((paths["root"].resolve(), paths["family"].resolve()))
+        for root in dict.fromkeys(roots):
+            if root.exists():
+                args += ["--ro-bind", str(root), str(root)]
+        args += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
+                 "--tmpfs", "/var/tmp", "--bind", str(self.work), str(self.work),
+                 "--chdir", str(self.work), "--clearenv", "--setenv", "PATH", os.defpath,
+                 "--setenv", "HOME", "/tmp", "--setenv", "LANG", "C.UTF-8", "--", *command]
+        return args
+
+    def close(self):
+        if self.fabric:
+            self.fabric.close(wait=True)
 
     def select_board(self, board):
         if board not in BOARDS:
@@ -433,7 +473,7 @@ class Lab:
                      "xc7_netlist.json", "routed.json", "design.fasm", "design.frames",
                      "route.log", "synth.rpt", "timing.rpt", "routed.dcp", "synth.dcp",
                      "design.bit", "sim.vvp", "tb.v", "stimulus.hex"):
-            (WORK / name).unlink(missing_ok=True)
+            (self.work / name).unlink(missing_ok=True)
         self.log = f"Selected {BOARDS[board]['name']} ({BOARDS[board]['part']}). Synthesize to build."
         return self.snapshot()
 
@@ -469,7 +509,7 @@ class Lab:
         artifact_names = [name for name in ("design.v", "adapter.v", "clock_adapter.v", "board.xdc", "netlist.json",
                           "xc7_netlist.json", "routed.json", "design.fasm", "design.frames",
                           "route.log", "synth.rpt", "timing.rpt", "routed.dcp", "design.bit")
-                          if (WORK / name).is_file() and (name != "design.bit" or self.bitstream)]
+                          if (self.work / name).is_file() and (name != "design.bit" or self.bitstream)]
         return {"phase": self.phase, "top": self.top, "buildTop": self.build_top,
                 "mappingSummary": self.mapping_summary,
                 "board": self.board, "boardName": config["name"], "part": config["part"],
@@ -489,7 +529,7 @@ class Lab:
                           "openxc7": bool(openxc7_paths(self.board))},
                 "backend": self.backend,
                 "bitstream": self.bitstream, "download": "/api/artifact/design.bit" if self.bitstream else None,
-                "preview": (WORK / "sim.vvp").exists(), "displayLeds": leds,
+                "preview": (self.work / "sim.vvp").exists(), "displayLeds": leds,
                 "fabricStatus": fabric_status, "fabricError": fabric_error,
                 "fabricWaveform": fabric_waveform, "artifacts": artifact_names}
 
@@ -511,32 +551,32 @@ class Lab:
                      "xc7_netlist.json", "routed.json", "design.fasm", "design.frames", "route.log",
                      "synth.rpt", "timing.rpt",
                      "routed.dcp", "synth.dcp", "design.bit", "sim.vvp", "tb.v", "stimulus.hex"):
-            (WORK / name).unlink(missing_ok=True)
-        (WORK / "design.v").write_text(code)
+            (self.work / name).unlink(missing_ok=True)
+        (self.work / "design.v").write_text(code)
         script = f"read_verilog -sv design.v; synth -top {top}; write_json user_netlist.json; stat"
-        output = run([tool_path("yosys"), "-Q", "-T", "-p", script])
-        design = json.loads((WORK / "user_netlist.json").read_text())
+        output = self.run([tool_path("yosys"), "-Q", "-T", "-p", script])
+        design = json.loads((self.work / "user_netlist.json").read_text())
         module = design["modules"].get(top)
         if not module:
             raise ValueError(f"Top module {top} not found")
         self.build_top, self.ports, self.mapping_summary = prepare_board_top(
-            top, module["ports"], self.board)
+            top, module["ports"], self.board, work=self.work)
         self.build_top, self.clock_actual_hz = prepare_clock_top(
-            self.build_top, self.ports, self.clock_hz)
-        make_constraints(self.ports, self.board)
-        write_vivado_scripts(self.build_top, self.board)
+            self.build_top, self.ports, self.clock_hz, work=self.work)
+        make_constraints(self.ports, self.board, work=self.work)
+        write_vivado_scripts(self.build_top, self.board, work=self.work)
         self.gates = len(module.get("cells", {}))
         if self.build_top != top:
             sources = " ".join(name for name in ("design.v", "adapter.v", "clock_adapter.v")
-                               if (WORK / name).is_file())
+                               if (self.work / name).is_file())
             build_script = (f"read_verilog -sv {sources}; "
                             f"synth -top {self.build_top}; write_json netlist.json; stat")
-            output += "\n--- Board adapters ---\n" + run(
+            output += "\n--- Board adapters ---\n" + self.run(
                 [tool_path("yosys"), "-Q", "-T", "-p", build_script])
         else:
-            (WORK / "netlist.json").write_bytes((WORK / "user_netlist.json").read_bytes())
+            (self.work / "netlist.json").write_bytes((self.work / "user_netlist.json").read_bytes())
         if tool_path("vivado"):
-            output += "\n--- Vivado synthesis ---\n" + run(
+            output += "\n--- Vivado synthesis ---\n" + self.run(
                 [tool_path("vivado"), "-mode", "batch", "-source", "synth.tcl", "-nojournal", "-nolog"], timeout=900)
             self.backend = "vivado"
         elif openxc7_paths(self.board):
@@ -549,10 +589,10 @@ class Lab:
 
     def synthesize_xc7(self):
         sources = " ".join(name for name in ("design.v", "adapter.v", "clock_adapter.v")
-                           if (WORK / name).is_file())
+                           if (self.work / name).is_file())
         script = (f"read_verilog -sv {sources}; synth_xilinx -family xc7 "
                   f"-top {self.build_top}; write_json xc7_netlist.json; stat")
-        output = run([tool_path("yosys"), "-Q", "-T", "-p", script], timeout=900)
+        output = self.run([tool_path("yosys"), "-Q", "-T", "-p", script], timeout=900)
         self.materialize_xc7_constants()
         return output
 
@@ -566,7 +606,7 @@ class Lab:
         input net, so the cell remains in the mapped netlist while its output
         stays constant for every input value.
         """
-        netlist_path = WORK / "xc7_netlist.json"
+        netlist_path = self.work / "xc7_netlist.json"
         design = json.loads(netlist_path.read_text())
         changed = False
         for module in design.get("modules", {}).values():
@@ -646,18 +686,18 @@ initial begin
 end
 endmodule
 """
-        (WORK / "tb.v").write_text(testbench)
+        (self.work / "tb.v").write_text(testbench)
         sources = [name for name in ("design.v", "adapter.v", "clock_adapter.v")
-                   if (WORK / name).is_file()]
-        run([tool_path("iverilog"), "-g2012", "-DFPGA_PREVIEW", "-s", "tb", "-o", "sim.vvp", *sources, "tb.v"])
+                   if (self.work / name).is_file()]
+        self.run([tool_path("iverilog"), "-g2012", "-DFPGA_PREVIEW", "-s", "tb", "-o", "sim.vvp", *sources, "tb.v"])
 
     def simulate(self):
-        if not (WORK / "sim.vvp").exists():
+        if not (self.work / "sim.vvp").exists():
             self.compile_preview()
         history = self.samples
         vectors = [((sample["buttons"] & 31) << 16) | sample["switches"] for sample in history]
-        (WORK / "stimulus.hex").write_text("\n".join(f"{value:06x}" for value in vectors) + "\n")
-        output = run([tool_path("vvp"), "sim.vvp", f"+N={len(vectors)}"], timeout=30)
+        (self.work / "stimulus.hex").write_text("\n".join(f"{value:06x}" for value in vectors) + "\n")
+        output = self.run([tool_path("vvp"), "sim.vvp", f"+N={len(vectors)}"], timeout=30)
         parsed = [line for line in output.splitlines() if line.startswith("@@SAMPLE ")]
         if len(parsed) != len(vectors):
             raise ValueError("Simulation ended before all samples were produced.\n" + output[-3000:])
@@ -688,7 +728,7 @@ endmodule
         self.phase = "synthesized"
         for name in ("design.bit", "routed.dcp", "timing.rpt", "routed.json",
                      "design.fasm", "design.frames", "route.log"):
-            (WORK / name).unlink(missing_ok=True)
+            (self.work / name).unlink(missing_ok=True)
         self.switches = switches
         self.buttons = {name: 0 for name in BUTTONS}
         self.samples = []
@@ -698,20 +738,20 @@ endmodule
             self.samples.append({"switches": switches, "buttons": button_word, "leds": "xxxx"})
         self.simulate()
         if self.backend == "vivado":
-            output = run([tool_path("vivado"), "-mode", "batch", "-source", "implement.tcl",
+            output = self.run([tool_path("vivado"), "-mode", "batch", "-source", "implement.tcl",
                           "-nojournal", "-nolog"], timeout=1800)
             self.phase = "implemented"
             self.log = "Placement and routing completed.\n" + output[-11_000:]
         elif openxc7_paths(self.board):
             paths = openxc7_paths(self.board)
-            if not (WORK / "xc7_netlist.json").is_file():
+            if not (self.work / "xc7_netlist.json").is_file():
                 self.synthesize_xc7()
-            output = run([str(paths["nextpnr-xilinx"]), "--chipdb", str(paths["chipdb"]),
+            output = self.run([str(paths["nextpnr-xilinx"]), "--chipdb", str(paths["chipdb"]),
                           "--xdc", "board.xdc", "--json", "xc7_netlist.json",
                           "--write", "routed.json", "--fasm", "design.fasm",
                           "--router", "router2"], timeout=1800)
-            (WORK / "route.log").write_text(output)
-            if not (WORK / "design.fasm").is_file() or not (WORK / "routed.json").is_file():
+            (self.work / "route.log").write_text(output)
+            if not (self.work / "design.fasm").is_file() or not (self.work / "routed.json").is_file():
                 raise ValueError("nextpnr finished without a routed design and FASM file")
             self.backend = "openxc7"
             self.phase = "implemented"
@@ -730,25 +770,25 @@ endmodule
             self.fabric = None
             self.fabric_armed = False
         self.phase, self.bitstream = "implemented", False
-        (WORK / "design.bit").unlink(missing_ok=True)
-        (WORK / "design.frames").unlink(missing_ok=True)
+        (self.work / "design.bit").unlink(missing_ok=True)
+        (self.work / "design.frames").unlink(missing_ok=True)
         if self.backend == "vivado":
-            output = run([tool_path("vivado"), "-mode", "batch", "-source", "bitstream.tcl",
+            output = self.run([tool_path("vivado"), "-mode", "batch", "-source", "bitstream.tcl",
                           "-nojournal", "-nolog"], timeout=1200)
         elif self.backend == "openxc7":
             paths = openxc7_paths(self.board)
             if not paths:
                 raise ValueError("Open XC7 tools or Basys3 chip database are missing")
             part = BOARDS[self.board]["part"]
-            output = run_to_file([str(paths["fasm2frames"]), "--part", part,
+            output = self.run_to_file([str(paths["fasm2frames"]), "--part", part,
                                   "--db-root", str(paths["family"]), "design.fasm"],
                                  "design.frames", timeout=300)
-            output += run([str(paths["xc7frames2bit"]), "--part_file", str(paths["part_file"]),
+            output += self.run([str(paths["xc7frames2bit"]), "--part_file", str(paths["part_file"]),
                            "--part_name", part, "--frm_file", "design.frames",
                            "--output_file", "design.bit"], timeout=300)
         else:
             raise ValueError("No implementation backend is available")
-        if not (WORK / "design.bit").is_file():
+        if not (self.work / "design.bit").is_file():
             raise ValueError("The bitstream tool did not produce design.bit")
         self.phase, self.bitstream = "bitstream", True
         self.log = "Artix-7 bitstream generated: design.bit\n" + output[-11_000:]
@@ -768,17 +808,17 @@ endmodule
                 if path not in sys.path:
                     sys.path.insert(0, path)
             from runtime import BoardRuntime
-            self.fabric = BoardRuntime()
+            self.fabric = BoardRuntime(program_root=self.work / "programs")
             self.fabric_armed = False
             self.fabric.control({"switches": self.switches, "running": False})
-            self.fabric.programmed((WORK / "design.bit").read_bytes())
+            self.fabric.programmed((self.work / "design.bit").read_bytes())
             self.log = "Bitstream generated. Decoding the programmed fabric for the board display.\n" + self.log
         except Exception as error:
             self.log = f"Bitstream generated; fabric decoder unavailable: {error}\n" + self.log
         return self.snapshot()
 
     def control(self, payload):
-        if not (WORK / "sim.vvp").exists():
+        if not (self.work / "sim.vvp").exists():
             raise ValueError("Choose switches with Implement to start the board preview")
         if "switches" in payload:
             value = payload["switches"]
@@ -805,7 +845,74 @@ endmodule
         return self.snapshot()
 
 
-LAB = None
+SESSION_COOKIE = "fpga_session"
+SESSION_TTL = 24 * 60 * 60
+
+
+class SessionError(Exception):
+    def __init__(self, message="Session expired. Reload the page to open your private workbench.", status=401):
+        super().__init__(message)
+        self.status = status
+
+
+class SessionStore:
+    def __init__(self, root, ttl=SESSION_TTL, limit=64):
+        self.root = Path(root)
+        self.ttl, self.limit = ttl, limit
+        self.lock = threading.RLock()
+        self.entries = {}
+
+    @staticmethod
+    def key(token):
+        if not isinstance(token, str) or not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
+            return None
+        return hashlib.sha256(token.encode()).hexdigest()
+
+    @contextmanager
+    def acquire(self, token, create=False):
+        now = time.monotonic()
+        expired = []
+        with self.lock:
+            for key, entry in list(self.entries.items()):
+                if not entry["active"] and now - entry["seen"] >= self.ttl:
+                    expired.append(self.entries.pop(key)["lab"])
+            key = self.key(token)
+            entry = self.entries.get(key)
+            fresh = entry is None
+            if fresh:
+                if not create:
+                    error = SessionError()
+                elif len(self.entries) >= self.limit:
+                    error = SessionError("All workspaces are in use. Please try again later.", 503)
+                else:
+                    error = None
+                    self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
+                    token = secrets.token_urlsafe(32)
+                    key = self.key(token)
+                    # Directory names are independent of the bearer cookie.
+                    work = tempfile.mkdtemp(prefix="lab-", dir=self.root)
+                    entry = {"lab": Lab(work), "seen": now, "active": 0}
+                    self.entries[key] = entry
+            else:
+                error = None
+            if error is None:
+                entry["active"] += 1
+                entry["seen"] = now
+        for lab in expired:
+            lab.close()
+            shutil.rmtree(lab.work)
+        if error:
+            raise error
+        try:
+            with entry["lab"].lock:
+                yield entry["lab"], token if fresh else None
+        finally:
+            with self.lock:
+                entry["active"] -= 1
+                entry["seen"] = time.monotonic()
+
+
+SESSIONS = SessionStore(WORK / "sessions")
 MIME = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8",
         ".js": "text/javascript; charset=utf-8", ".jpg": "image/jpeg", ".png": "image/png",
         ".svg": "image/svg+xml", ".avif": "image/avif"}
@@ -819,39 +926,74 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", kind)
         self.send_header("Content-Length", str(len(data)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("CDN-Cache-Control", "no-store")
+        self.send_header("Vary", "Cookie")
+        if getattr(self, "pending_cookie", None):
+            self.send_header("Set-Cookie", self.pending_cookie)
+            self.pending_cookie = None
         self.send_header("X-Content-Type-Options", "nosniff")
         if filename:
             self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.end_headers()
         self.wfile.write(data)
 
+    def session_token(self):
+        cookie = SimpleCookie()
+        try:
+            cookie.load(self.headers.get("Cookie", ""))
+        except CookieError:
+            return None
+        item = cookie.get(SESSION_COOKIE)
+        return item.value if item else None
+
+    def set_session_cookie(self, token):
+        cookie = SimpleCookie()
+        cookie[SESSION_COOKIE] = token
+        cookie[SESSION_COOKIE]["path"] = "/"
+        cookie[SESSION_COOKIE]["httponly"] = True
+        cookie[SESSION_COOKIE]["samesite"] = "Strict"
+        # TLS terminates at Cloudflare/Vercel; plain HTTP is only for local use.
+        if self.headers.get("X-Forwarded-Proto", "").split(",")[0].strip() == "https":
+            cookie[SESSION_COOKIE]["secure"] = True
+        self.pending_cookie = cookie.output(header="").strip()
+
+    def valid_origin(self):
+        origin = self.headers.get("Origin")
+        allowed = {value.strip().rstrip("/") for value in
+                   os.environ.get("ALLOWED_ORIGINS", "").split(",") if value.strip()}
+        if self.headers.get("Sec-Fetch-Site") == "cross-site":
+            return False
+        return not origin or (urlsplit(origin).netloc == self.headers.get("Host")
+                              and urlsplit(origin).scheme in ("http", "https")) or origin in allowed
+
     def do_GET(self):
         path = urlsplit(self.path).path
         if path in ("/api/health", "/healthz"):
-            # Builds hold LAB.lock; a health check must remain responsive during them.
             self.send_data({"ok": True})
             return
-        if path == "/api/status":
-            with LAB.lock:
-                self.send_data(LAB.snapshot())
-            return
-        if path == "/api/source":
-            with LAB.lock:
-                self.send_data({"code": LAB.code, "top": LAB.top})
-            return
-        if path.startswith("/api/artifact/"):
-            name = path.removeprefix("/api/artifact/")
-            allowed = {"design.v", "adapter.v", "clock_adapter.v", "board.xdc", "netlist.json", "xc7_netlist.json",
-                       "routed.json", "design.fasm", "design.frames", "route.log", "synth.rpt",
-                       "timing.rpt", "routed.dcp", "design.bit"}
-            file = WORK / name
-            if name in allowed and file.is_file() and (name != "design.bit" or LAB.bitstream):
-                kind = ("text/plain; charset=utf-8" if file.suffix in
-                        (".v", ".xdc", ".rpt", ".json", ".fasm", ".frames", ".log")
-                        else "application/octet-stream")
-                self.send_data(file.read_bytes(), kind, filename=name)
-            else:
-                self.send_data({"error": "Artifact not found"}, status=404)
+        if path.startswith("/api/"):
+            if not self.valid_origin():
+                self.send_data({"error": "Cross-origin request rejected"}, status=403)
+                return
+            if path not in ("/api/session", "/api/source", "/api/status") and not path.startswith("/api/artifact/"):
+                self.send_data({"error": "Not found"}, status=404)
+                return
+            try:
+                # /source also bootstraps older deployed clients, but only ever
+                # returns the public starter design to a visitor without a cookie.
+                with SESSIONS.acquire(self.session_token(), create=path in ("/api/session", "/api/source")) as (lab, token):
+                    if token:
+                        self.set_session_cookie(token)
+                    if path == "/api/session":
+                        self.send_data({"ok": True})
+                    elif path == "/api/source":
+                        self.send_data({"code": lab.code, "top": lab.top})
+                    elif path == "/api/status":
+                        self.send_data(lab.snapshot())
+                    else:
+                        self.send_artifact(lab, path.removeprefix("/api/artifact/"))
+            except SessionError as error:
+                self.send_data({"error": str(error)}, status=error.status)
             return
         if path == "/basys3.jpg":
             self.send_data((ROOT / "web/basys3.jpg").read_bytes(), "image/jpeg")
@@ -870,18 +1012,34 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.send_data({"error": "Not found"}, status=404)
 
+    def send_artifact(self, lab, name):
+        allowed = {"design.v", "adapter.v", "clock_adapter.v", "board.xdc", "netlist.json", "xc7_netlist.json",
+                   "routed.json", "design.fasm", "design.frames", "route.log", "synth.rpt",
+                   "timing.rpt", "routed.dcp", "design.bit"}
+        file = lab.work / name
+        if name not in allowed or file.is_symlink() or not file.is_file() or (name == "design.bit" and not lab.bitstream):
+            self.send_data({"error": "Artifact not found"}, status=404)
+            return
+        kind = ("text/plain; charset=utf-8" if file.suffix in
+                (".v", ".xdc", ".rpt", ".json", ".fasm", ".frames", ".log")
+                else "application/octet-stream")
+        self.send_data(file.read_bytes(), kind, filename=name)
+
     def do_POST(self):
         path = urlsplit(self.path).path
         if path not in ("/api/board", "/api/synthesize", "/api/implement", "/api/bitstream", "/api/control"):
             self.send_data({"error": "Not found"}, status=404)
             return
-        origin = self.headers.get("Origin")
-        allowed_origins = {value.strip().rstrip("/") for value in
-                           os.environ.get("ALLOWED_ORIGINS", "").split(",") if value.strip()}
-        if (origin and urlsplit(origin).netloc != self.headers.get("Host")
-                and origin not in allowed_origins):
+        if not self.valid_origin():
             self.send_data({"error": "Cross-origin request rejected"}, status=403)
             return
+        try:
+            with SESSIONS.acquire(self.session_token()) as (lab, _):
+                self.post_to_lab(lab, path)
+        except SessionError as error:
+            self.send_data({"error": str(error)}, status=error.status)
+
+    def post_to_lab(self, lab, path):
         try:
             length = int(self.headers.get("Content-Length", "0"))
             if not 1 <= length <= MAX_SOURCE + 10_000:
@@ -891,32 +1049,29 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length))
             if not isinstance(payload, dict):
                 raise ValueError("Expected an object")
-            with LAB.lock:
-                if path == "/api/board":
-                    result = LAB.select_board(payload.get("board"))
-                elif path == "/api/synthesize":
-                    result = LAB.synthesize(payload.get("code"), payload.get("top"),
-                                            payload.get("clockHz", BOARD_CLOCK_HZ))
-                elif path == "/api/implement":
-                    result = LAB.implement(payload.get("switches"))
-                elif path == "/api/bitstream":
-                    result = LAB.generate()
-                else:
-                    result = LAB.control(payload)
+            if path == "/api/board":
+                result = lab.select_board(payload.get("board"))
+            elif path == "/api/synthesize":
+                result = lab.synthesize(payload.get("code"), payload.get("top"),
+                                        payload.get("clockHz", BOARD_CLOCK_HZ))
+            elif path == "/api/implement":
+                result = lab.implement(payload.get("switches"))
+            elif path == "/api/bitstream":
+                result = lab.generate()
+            else:
+                result = lab.control(payload)
             self.send_data(result)
         except (ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
-            with LAB.lock:
-                if path == "/api/synthesize":
-                    LAB.phase = "ready"
-                    LAB.backend = None
-                    LAB.gates = None
-                    LAB.ports = {}
-                    for name in ("adapter.v", "clock_adapter.v", "netlist.json", "user_netlist.json", "board.xdc",
-                                 "xc7_netlist.json", "routed.json", "design.fasm", "design.frames", "route.log",
-                                 "synth.rpt", "synth.dcp",
-                                 "timing.rpt", "routed.dcp", "design.bit", "sim.vvp"):
-                        (WORK / name).unlink(missing_ok=True)
-                LAB.log = str(error)
+            if path == "/api/synthesize":
+                lab.phase = "ready"
+                lab.backend = None
+                lab.gates = None
+                lab.ports = {}
+                for name in ("adapter.v", "clock_adapter.v", "netlist.json", "user_netlist.json", "board.xdc",
+                             "xc7_netlist.json", "routed.json", "design.fasm", "design.frames", "route.log",
+                             "synth.rpt", "synth.dcp", "timing.rpt", "routed.dcp", "design.bit", "sim.vvp"):
+                    (lab.work / name).unlink(missing_ok=True)
+            lab.log = str(error)
             self.send_data({"error": str(error)}, status=400)
 
     def log_message(self, format, *args):
@@ -924,7 +1079,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    LAB = Lab()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)

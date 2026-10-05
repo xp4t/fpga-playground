@@ -164,7 +164,7 @@ function showNotice(message, type='error') {
 async function requestJSON(path, options) {
   let response;
   try {
-    response = await fetch(path, options);
+    response = await fetch(path, {credentials: 'same-origin', cache: 'no-store', ...options});
   } catch {
     throw new Error('Cannot reach the FPGA backend. Check that the backend is running and the /api route is configured.');
   }
@@ -457,7 +457,7 @@ function setupEditor() {
     suggestTop();
     updateLines();
     renderControls();
-    try { localStorage.setItem('fpga-workbench-code', $('editor').value); } catch {}
+    try { localStorage.setItem('fpga-workbench-private-code-v1', $('editor').value); } catch {}
   });
   $('editor').addEventListener('scroll', () => { $('line-numbers').scrollTop = $('editor').scrollTop; });
   $('editor').addEventListener('keydown', (event) => {
@@ -539,11 +539,12 @@ function renderDialogSwitches() {
 
 async function loadWorkbench(preserveEditor = false) {
   const keepEdits = preserveEditor && (state !== null || $('editor').value.length > 0);
+  await requestJSON('/api/session');
   const [source,status]=await Promise.all([requestJSON('/api/source'),requestJSON('/api/status')]);
   state=status;
   if (!keepEdits) clockSelectionHz = state.clockHz || 100000000;
   let saved;
-  try { saved=localStorage.getItem('fpga-workbench-code'); } catch {}
+  try { saved=localStorage.getItem('fpga-workbench-private-code-v1'); } catch {}
   if (!keepEdits) {
     $('editor').value=saved||source.code;
     $('top-module').value=source.top;

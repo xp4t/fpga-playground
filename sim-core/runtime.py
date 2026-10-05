@@ -18,7 +18,8 @@ LOG = logging.getLogger("runtime")
 
 
 class BoardRuntime:
-    def __init__(self):
+    def __init__(self, program_root=None):
+        self.program_root = Path(program_root) if program_root is not None else ROOT / "build/programs"
         self.lock = threading.RLock()
         self.stop_event = threading.Event()
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="decode")
@@ -57,7 +58,7 @@ class BoardRuntime:
         try:
             from pipeline import convert
             digest = hashlib.sha256(data).hexdigest()
-            output = ROOT / "build/programs" / digest
+            output = self.program_root / digest
             output.mkdir(parents=True, exist_ok=True)
             capture = output / "configuration.bin"
             capture.write_bytes(data)
@@ -223,7 +224,7 @@ class BoardRuntime:
                     self.error = str(error)
                     self.running = False
 
-    def close(self):
+    def close(self, wait=False):
         self.stop_event.set()
         self.thread.join(timeout=2)
-        self.executor.shutdown(wait=False, cancel_futures=True)
+        self.executor.shutdown(wait=wait, cancel_futures=True)

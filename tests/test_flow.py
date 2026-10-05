@@ -41,7 +41,7 @@ class FlowTests(unittest.TestCase):
         server.WORK = Path(self.directory.name)
         self.openxc7_patch = mock.patch.object(server, "openxc7_paths", return_value=None)
         self.openxc7_patch.start()
-        self.lab = server.Lab()
+        self.lab = server.Lab(server.WORK)
 
     def tearDown(self):
         self.openxc7_patch.stop()
@@ -163,7 +163,7 @@ class OpenXC7FlowTests(unittest.TestCase):
             with self.subTest(board=board), tempfile.TemporaryDirectory() as directory:
                 original_work = server.WORK
                 server.WORK = Path(directory)
-                lab = server.Lab()
+                lab = server.Lab(server.WORK)
                 try:
                     lab.select_board(board)
                     self.assertEqual(lab.synthesize(source, "counter")["backend"], "openxc7")
@@ -183,7 +183,7 @@ class OpenXC7FlowTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             original_work = server.WORK
             server.WORK = Path(directory)
-            lab = server.Lab()
+            lab = server.Lab(server.WORK)
             try:
                 self.assertEqual(lab.synthesize(server.DEFAULT_CODE, "counter", 1)["clockActualHz"], 1)
                 self.assertEqual(lab.implement(1)["phase"], "implemented")

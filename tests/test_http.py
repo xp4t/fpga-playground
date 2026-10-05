@@ -5,6 +5,7 @@ import json
 import threading
 import unittest
 from types import SimpleNamespace
+from contextlib import contextmanager
 from unittest import mock
 
 import server
@@ -33,7 +34,10 @@ class OriginTests(unittest.TestCase):
         connection = MemorySocket(request)
         lab = SimpleNamespace(lock=threading.RLock(),
                               select_board=mock.Mock(return_value={"board": "basys3"}))
-        with mock.patch.object(server, "LAB", lab), mock.patch.dict(
+        @contextmanager
+        def acquire(*args, **kwargs):
+            yield lab, None
+        with mock.patch.object(server, "SESSIONS", SimpleNamespace(acquire=acquire)), mock.patch.dict(
                 server.os.environ, {"ALLOWED_ORIGINS": allowed}):
             server.Handler(connection, ("127.0.0.1", 12345), SimpleNamespace())
         header, body = bytes(connection.response).split(b"\r\n\r\n", 1)

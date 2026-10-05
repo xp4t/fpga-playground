@@ -2,7 +2,7 @@
 FROM python:3.11-slim-bookworm
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends yosys iverilog \
+    && apt-get install -y --no-install-recommends yosys iverilog bubblewrap \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 10001 workbench
 

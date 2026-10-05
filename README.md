@@ -4,7 +4,9 @@ A browser workbench for editing Verilog, synthesizing it, choosing virtual switc
 
 ## Run locally
 
-Install `yosys`, `iverilog`, and `vvp` on your path. For Basys 3 bitstream decoding, also install the Python dependencies into a local environment:
+On Linux, install `yosys`, `iverilog`, `vvp`, and Bubblewrap (`bwrap`) on your path.
+Unprivileged user namespaces must be available; builds fail closed if the sandbox
+cannot start. For Basys 3 bitstream decoding, also install the Python dependencies into a local environment:
 
 ```sh
 python3 -m venv .venv
@@ -42,9 +44,12 @@ The interface reports that the backend is not connected.
 
 ### Free hosted RTL preview on Render
 
-The included `Dockerfile` installs Python, Yosys, and Icarus Verilog and runs as
+The included `Dockerfile` installs Python, Yosys, Icarus Verilog, and Bubblewrap and runs as
 an unprivileged user. It supports synthesis, board simulation, and waveforms.
-It does not install open XC7, Vivado, or the optional bitstream decoder.
+It does not install open XC7, Vivado, or the optional bitstream decoder. The host
+must permit Bubblewrap's user namespaces inside the container. Hosted services
+that prohibit them cannot run builds with this configuration; use the Linux PC
+backend below instead of disabling isolation.
 
 1. Push the updated repository to GitHub.
 2. On Render, create a **Web Service**, connect the repository, choose the
@@ -103,11 +108,38 @@ retaining `/api/:path*`. The machine, server, and tunnel must remain running.
 Quick Tunnel hostnames change whenever the tunnel restarts. For a stable address,
 configure a named tunnel with a domain you control or a Linux server with HTTPS.
 
-Both deployment examples currently expose a single shared workbench, not separate
-user projects. Run the HDL tools in an isolated environment and add authentication
-before opening the service for public submissions. The Docker image isolates
-files from the host, but does not add user authentication, per-job resource limits,
-or separate workspaces for visitors.
+### Private browser workspaces
+
+Each browser session has its own `Lab`, lock, randomly named directory under
+`.work/sessions/`, RTL, logs, board state, waveform, and artifacts. A server-issued
+256-bit random cookie selects the session. It is host-only, HttpOnly, SameSite=Strict,
+and Secure when served through the HTTPS proxy. Session tokens never appear in
+artifact URLs or filesystem paths. Vercel must forward cookies and `Set-Cookie`;
+API responses carry `Cache-Control: no-store`, `CDN-Cache-Control: no-store`, and
+`Vary: Cookie`.
+
+The frontend first calls `/api/session`, then loads source and status. Requests to
+state-changing endpoints and downloads without a valid session return 401.
+For older clients, `/api/source` can create a session, returning only the public
+starter design. There is no fallback to the former global workbench. Old browser
+drafts from the shared-workbench version are not imported automatically.
+
+FPGA tools run in Bubblewrap with only system/toolchain files mounted read-only
+and the current workspace writable. Other workspaces, the host home directory,
+and the network are unavailable to HDL file-reading commands. Decoder outputs
+are also stored inside the session workspace.
+
+Sessions expire after 24 hours without workspace requests and are cleaned up on
+later workspace requests; active requests pin their session until completion.
+At most 64 sessions are retained at once. A backend restart invalidates sessions;
+old on-disk directories are never reattached to a visitor. The editor keeps new
+drafts in browser-local storage, so users can resynthesize after a restart.
+Tabs in one browser profile share that browser's session; another browser,
+profile, or device gets a separate workspace. This is anonymous session isolation,
+not a login system or durable account storage. Public deployments still need
+authentication and resource quotas to control who can submit builds.
+
+Test isolation with `python3 -m unittest discover -s tests -p test_sessions.py -v`.
 
 The build endpoints are currently synchronous and can run for many minutes.
 [Vercel external rewrites](https://vercel.com/docs/limits) time out after 120 seconds.
@@ -165,7 +197,9 @@ The included `virtual-basys3` bitstream decoder is hardwired to the Basys 3 part
 - [Project X-Ray](https://github.com/f4pga/prjxray) and its [7-series database](https://github.com/f4pga/prjxray-db), by the Project X-Ray contributors including Antmicro, Google LLC, Claire Wolf, Rick Altherr, Jake Mercer, and David Shah, document and encode the Artix-7 configuration frames.
 - The [FPGAwars open XC7 package](https://github.com/FPGAwars/tools-openxc7) was started by Juan González-Gómez, with cross-platform packaging and toolchain contributions by Carlos Venegas. It assembles these tools for the supported Artix-7 parts.
 
-The server is a single-user local development tool. It invokes HDL tools on submitted code and has no authentication or per-user sandbox. Isolate it and add authentication before exposing it on a public network.
+The server runs FPGA tools on submitted code in isolated browser workspaces.
+It has no account authentication or CPU/disk quotas; those are separate from
+the session and filesystem isolation described above.
 
 Run the automated tool checks with `python3 -m unittest discover -s tests -v`.
 
