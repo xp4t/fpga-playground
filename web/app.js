@@ -136,11 +136,31 @@ function showNotice(message, type='error') {
   showNotice.timeout = setTimeout(() => { notice.hidden = true; }, 6500);
 }
 
-async function api(path, payload) {
-  const response = await fetch(path, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
-  const data = await response.json();
+async function requestJSON(path, options) {
+  let response;
+  try {
+    response = await fetch(path, options);
+  } catch {
+    throw new Error('Cannot reach the FPGA backend. Check that the backend is running and the /api route is configured.');
+  }
+  if (!response.headers.get('Content-Type')?.toLowerCase().includes('application/json')) {
+    if (response.status === 404) {
+      throw new Error('FPGA backend not connected. Configure Vercel to forward /api requests to your running backend.');
+    }
+    throw new Error(`FPGA backend returned a non-JSON response (HTTP ${response.status}). Check the backend URL and service logs; a sleeping service may need time to start.`);
+  }
+  let data;
+  try {
+    data = await response.json();
+  } catch {
+    throw new Error(`FPGA backend returned invalid JSON (HTTP ${response.status}). Check the backend service logs.`);
+  }
   if (!response.ok) throw new Error(data.error || 'Request failed');
   return data;
+}
+
+async function api(path, payload) {
+  return requestJSON(path, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
 }
 
 async function action(path, payload) {
@@ -158,7 +178,7 @@ async function action(path, payload) {
   } catch (error) {
     showNotice(error.message);
     $('build-log').textContent = error.message;
-    try { state = await (await fetch('/api/status')).json(); render(); } catch {}
+    try { state = await requestJSON('/api/status'); render(); } catch {}
     return false;
   } finally {
     busy = false;
@@ -499,9 +519,8 @@ async function init() {
     await control({button:'btnC',value:true});
     await control({button:'btnC',value:false});
   });
-  const [sourceResponse,statusResponse]=await Promise.all([fetch('/api/source'),fetch('/api/status')]);
-  const source=await sourceResponse.json();
-  state=await statusResponse.json();
+  const [source,status]=await Promise.all([requestJSON('/api/source'),requestJSON('/api/status')]);
+  state=status;
   clockSelectionHz = state.clockHz || 100000000;
   let saved;
   try { saved=localStorage.getItem('fpga-workbench-code'); } catch {}
@@ -513,8 +532,12 @@ async function init() {
   render();
   setInterval(async () => {
     if (busy || running || !state?.fabricStatus || state.fabricStatus==='error') return;
-    try { state=await (await fetch('/api/status')).json(); render(); } catch {}
+    try { state=await requestJSON('/api/status'); render(); } catch {}
   }, 900);
 }
 
-init().catch(error => showNotice(`Unable to connect to the workbench: ${error.message}`));
+init().catch(error => {
+  $('build-status').textContent = 'Backend unavailable';
+  $('build-log').textContent = error.message;
+  showNotice(`Unable to connect to the workbench: ${error.message}`);
+});

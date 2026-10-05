@@ -3,5 +3,11 @@
   "framework": null,
   "installCommand": "",
   "buildCommand": "mkdir -p dist && cp -r web/. dist/ && cp artya7.png nexysa7.avif dist/",
-  "outputDirectory": "dist"
+  "outputDirectory": "dist",
+  "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "https://kelkoo-clara-mac-sort.trycloudflare.com/api/:path*"
+    }
+  ]
 }
