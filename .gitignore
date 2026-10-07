@@ -1,6 +1,7 @@
 # Local workbench output and installed toolchain
 .work/
 .tools/
+.aws/
 
 # Python and test artifacts
 .venv/
@@ -13,6 +14,7 @@ htmlcov/
 
 # JavaScript dependencies and test output
 node_modules/
+.vercel/
 test-results/
 
 # FPGA builds and simulation output
@@ -42,3 +44,4 @@ obj_dir/
 *.swp
 *~
 .DS_Store
+.env*

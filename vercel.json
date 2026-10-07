@@ -11,13 +11,25 @@
     }
   },
   "rewrites": [
-    { "source": "/", "destination": "/api/availability" },
-    { "source": "/index.html", "destination": "/api/availability" },
-    { "source": "/healthz", "destination": "/api/availability?check=1" },
-    { "source": "/api/availability", "destination": "/api/availability" },
+    {
+      "source": "/",
+      "destination": "/api/availability"
+    },
+    {
+      "source": "/index.html",
+      "destination": "/api/availability"
+    },
+    {
+      "source": "/healthz",
+      "destination": "/api/availability?check=1"
+    },
+    {
+      "source": "/api/availability",
+      "destination": "/api/availability"
+    },
     {
       "source": "/api/:path*",
-      "destination": "https://kelkoo-clara-mac-sort.trycloudflare.com/api/:path*"
+      "destination": "https://posts-indirect-burn-striking.trycloudflare.com/api/:path*"
     }
   ]
 }

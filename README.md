@@ -108,6 +108,55 @@ retaining `/api/:path*`. The machine, server, and tunnel must remain running.
 Quick Tunnel hostnames change whenever the tunnel restarts. For a stable address,
 configure a named tunnel with a domain you control or a Linux server with HTTPS.
 
+### This PC's installed backend
+
+The local deployment keeps its Python environment, FPGA tools, and tunnel client
+under `.tools/` (excluded from Git and Vercel uploads). Start the detached server
+and HTTPS tunnel with:
+
+```sh
+bash scripts/start_pc_backend.sh
+```
+
+This installation pairs open XC7 `2026-09-24` with its required YosysHQ
+OSS CAD Suite `2026-03-24`. Python 3.9 and a recent Bubblewrap are installed in
+`.tools/runtime`; the older system Python and Bubblewrap are not used.
+
+The server listens only on `127.0.0.1:8000` and allows the production frontend
+origin `https://fpga-playground.vercel.app`. Logs are in `.work/backend.log` and
+`.work/tunnel.log`. These processes survive closing the terminal.
+
+Boot startup is installed in this user's crontab with:
+
+```sh
+.tools/runtime/bin/python scripts/pc_boot.py --install
+```
+
+The system's enabled cron service runs `scripts/boot_pc_backend.sh` at boot,
+before a desktop login, and checks every minute. It starts missing processes
+and retries if the network is still coming up. No sudo password is needed.
+The installer manages only this project's marked entries and preserves other
+cron jobs, including unrelated entries inside those markers.
+When a Quick Tunnel gets a new hostname, the job checks its health, updates
+only the external API rewrite, and redeploys the existing `fpga-pg/fpga-playground`
+Vercel project using the saved CLI login. Deployments are non-interactive, and
+a lock prevents overlapping startup/deployment jobs. If the Vercel login is
+revoked, the backend still starts but website reconnection requires renewing
+that Vercel login. Logs are in `.work/boot.log`. Run the boot script manually
+to perform the same check immediately. For an address that survives tunnel
+restarts without a Vercel redeployment, use a named Cloudflare tunnel with a
+domain you own. The home filesystem must be available at boot (as it is on
+this PC); a home directory encrypted until login would prevent this setup.
+
+Only frontend assets, `api/availability.js`, and `vercel.json` are uploaded by
+the Vercel CLI, as specified by `.vercelignore`. Local toolchains, workspace
+files, account credentials, and the Python backend stay on this PC.
+
+Anyone can run their own copy of a public repository. Replacing this website's
+backend requires changing the owning Vercel project or its connected repository
+with authorized credentials; a clone does not grant that access. Vercel's fork
+protection is enabled on the existing project.
+
 ### Private browser workspaces
 
 Each browser session has its own `Lab`, lock, randomly named directory under
