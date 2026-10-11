@@ -1,5 +1,9 @@
 """Two independent HTTP clients must never share RTL, state, or artifacts."""
 import http.cookiejar
+import io
+import email
+import time
+from types import SimpleNamespace
 import json
 import secrets
 import shutil
@@ -13,32 +17,63 @@ from pathlib import Path
 from unittest import mock
 
 import server
+from support import SANDBOX_AVAILABLE
+from test_http import MemorySocket
 
 
 class Client:
     def __init__(self, base):
         self.base = base
         self.cookies = http.cookiejar.CookieJar()
+        self.memory_cookie = None
         self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(self.cookies))
 
-    def request(self, path, payload=None, headers=None):
+    def request(self, path, payload=None, headers=None, wait=True):
         headers = dict(headers or {})
         data = None
         if payload is not None:
             data = json.dumps(payload).encode()
             headers['Content-Type'] = 'application/json'
-        request = urllib.request.Request(self.base + path, data=data, headers=headers)
-        try:
-            response = self.opener.open(request, timeout=30)
-        except urllib.error.HTTPError as error:
-            response = error
-        with response:
-            body = response.read()
-            if response.headers.get_content_type() == 'application/json':
+        if self.base == 'memory:':
+            if self.memory_cookie and 'Cookie' not in headers:
+                headers['Cookie'] = self.memory_cookie
+            headers.update({'Host': 'localhost', 'Content-Length': str(len(data or b''))})
+            raw = f"{'POST' if data is not None else 'GET'} {path} HTTP/1.1\r\n"
+            raw += ''.join(f'{name}: {value}\r\n' for name, value in headers.items())
+            connection = MemorySocket(raw.encode() + b'\r\n' + (data or b''))
+            server.Handler(connection, ('127.0.0.1', 12345), SimpleNamespace())
+            header, body = bytes(connection.response).split(b'\r\n\r\n', 1)
+            status = int(header.split(b' ', 2)[1])
+            response_headers = email.message_from_bytes(header.split(b'\r\n', 1)[1])
+            if response_headers.get('Set-Cookie'):
+                self.memory_cookie = response_headers['Set-Cookie'].split(';')[0]
+            if response_headers.get_content_type() == 'application/json':
                 body = json.loads(body)
-            return response.status, body, response.headers
+        else:
+            request = urllib.request.Request(self.base + path, data=data, headers=headers)
+            try:
+                response = self.opener.open(request, timeout=30)
+            except urllib.error.HTTPError as error:
+                response = error
+            with response:
+                body = response.read()
+                if response.headers.get_content_type() == 'application/json':
+                    body = json.loads(body)
+                status, response_headers = response.status, response.headers
+        if status == 202 and wait:
+            deadline = time.monotonic() + 30
+            while body['status'] in ('queued', 'running'):
+                if time.monotonic() > deadline:
+                    raise TimeoutError('Test build did not complete')
+                time.sleep(0.01)
+                _, body, _ = self.request('/api/jobs/' + body['jobId'])
+            status = 200 if body['status'] == 'succeeded' else 400
+            body = body['result'] if status == 200 else {'error': body['error']}
+        return status, body, response_headers
 
     def token(self):
+        if self.base == 'memory:':
+            return self.memory_cookie.split('=', 1)[1]
         return next(cookie.value for cookie in self.cookies if cookie.name == server.SESSION_COOKIE)
 
 
@@ -50,16 +85,27 @@ class SessionHTTPTests(unittest.TestCase):
         self.patch.start()
         self.tools = mock.patch.object(server, 'openxc7_paths', return_value=None)
         self.tools.start()
-        self.http = server.ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
-        self.thread = threading.Thread(target=self.http.serve_forever, daemon=True)
-        self.thread.start()
-        self.base = f'http://127.0.0.1:{self.http.server_port}'
+        self.jobs_patch = mock.patch.object(server, 'JOBS', server.JobStore())
+        self.jobs_patch.start()
+        try:
+            self.http = server.ThreadingHTTPServer(('127.0.0.1', 0), server.Handler)
+        except PermissionError:
+            self.http = None
+            self.base = 'memory:'
+        else:
+            self.thread = threading.Thread(target=self.http.serve_forever, daemon=True)
+            self.thread.start()
+            self.base = f'http://127.0.0.1:{self.http.server_port}'
+
         self.a, self.b = Client(self.base), Client(self.base)
 
     def tearDown(self):
-        self.http.shutdown()
-        self.http.server_close()
-        self.thread.join()
+        if self.http:
+            self.http.shutdown()
+            self.http.server_close()
+            self.thread.join()
+        server.JOBS.queue.join()
+        self.jobs_patch.stop()
         for entry in self.store.entries.values():
             entry['lab'].close()
         self.patch.stop()
@@ -88,10 +134,12 @@ class SessionHTTPTests(unittest.TestCase):
         outsider = Client(self.base)
         self.assertEqual(outsider.request('/api/status', headers={
             'Cookie': f'{server.SESSION_COOKIE}={secrets.token_urlsafe(32)}'})[0], 401)
-        self.assertEqual(outsider.request('/api/session', headers={
-            'X-Forwarded-Proto': 'https'})[0], 200)
-        self.assertIn('Secure', outsider.request('/api/session', headers={
-            'X-Forwarded-Proto': 'https'})[2]['Set-Cookie'])
+        with mock.patch.dict(server.os.environ, {'BACKEND_SECRET': 'test-secret'}):
+            headers = {'X-Forwarded-Proto': 'https', 'X-Backend-Secret': 'test-secret'}
+            # The previous invalid cookie creates a fresh authenticated proxy session.
+            status, _, secure_headers = outsider.request('/api/session', headers=headers)
+            self.assertEqual(status, 200)
+            self.assertIn('Secure', secure_headers['Set-Cookie'])
 
     def test_cross_origin_reads_and_mutations_rejected(self):
         self.a.request('/api/session')
@@ -101,7 +149,7 @@ class SessionHTTPTests(unittest.TestCase):
         self.assertEqual(self.a.request('/api/board', {'board': 'arty_a7_100t'},
                                        {'Origin': 'https://evil.example'})[0], 403)
 
-    @unittest.skipUnless(all(shutil.which(name) for name in ('yosys', 'iverilog', 'vvp', 'bwrap')),
+    @unittest.skipUnless(SANDBOX_AVAILABLE and all(shutil.which(name) for name in ('yosys', 'iverilog', 'vvp', 'bwrap')),
                          'FPGA tools and Bubblewrap required')
     def test_concurrent_builds_artifacts_failures_and_controls_are_isolated(self):
         for client in (self.a, self.b):
@@ -139,7 +187,7 @@ class SessionHTTPTests(unittest.TestCase):
         for name in (f'../{other_dir}/design.v', f'%2e%2e/{other_dir}/design.v', '/etc/passwd'):
             self.assertEqual(self.a.request('/api/artifact/' + name)[0], 404)
 
-    @unittest.skipUnless(shutil.which('bwrap') and shutil.which('yosys'), 'Sandbox and synthesis required')
+    @unittest.skipUnless(SANDBOX_AVAILABLE and shutil.which('bwrap') and shutil.which('yosys'), 'Sandbox and synthesis required')
     def test_hdl_cannot_read_another_workspace_or_host_file(self):
         self.a.request('/api/session')
         self.b.request('/api/session')

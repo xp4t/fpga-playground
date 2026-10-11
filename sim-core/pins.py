@@ -31,8 +31,9 @@ def parse_xdc(path, include_commented=False):
 
 
 class BoardPins:
-    def __init__(self, simulator, package_csv, master_xdc):
+    def __init__(self, simulator, package_csv, master_xdc, led_count=16):
         self.simulator = simulator
+        self.led_count = led_count
         with open(package_csv, newline="") as stream:
             sites = {row["site"]: row["pin"] for row in csv.DictReader(stream)}
         physical = {}
@@ -54,7 +55,7 @@ class BoardPins:
         return self.simulator.read(self.ports[name]) if name in self.ports else None
 
     def led_word(self):
-        values = [self.read(f"led[{i}]") for i in range(16)]
+        values = [self.read(f"led[{i}]") for i in range(self.led_count)]
         return None if None in values else sum(value << i for i, value in enumerate(values))
 
     def cycle(self):

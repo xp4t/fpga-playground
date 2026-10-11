@@ -2,10 +2,13 @@
 """Local browser workbench for Basys3 RTL, simulation, and Artix-7 builds."""
 
 import argparse
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import hashlib
 from http.cookies import SimpleCookie, CookieError
 import secrets
+import queue
+import hmac
+from collections import deque
 import tempfile
 import time
 import importlib.util
@@ -23,6 +26,7 @@ from urllib.parse import urlsplit
 ROOT = Path(__file__).resolve().parent
 WORK = ROOT / ".work"
 MAX_SOURCE = 100_000
+MAX_REQUEST = MAX_SOURCE * 2 + 10_000
 MAX_PREVIEW_CYCLES = 4096
 BOARD_CLOCK_HZ = 100_000_000
 BUTTONS = ("btnC", "btnU", "btnD", "btnL", "btnR")
@@ -87,30 +91,8 @@ def openxc7_paths(board="basys3"):
     return None
 
 
-def run(command, cwd, timeout=120):
-    try:
-        result = subprocess.run(command, cwd=cwd, text=True, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, timeout=timeout, check=False)
-    except subprocess.TimeoutExpired as error:
-        raise ValueError(f"Tool timed out after {timeout}s: {command[0]}") from error
-    output = result.stdout[-24_000:]
-    if result.returncode:
-        raise ValueError(output.strip() or f"{command[0]} exited with {result.returncode}")
-    return output
-
-
-def run_to_file(command, output_file, cwd, timeout=120):
-    try:
-        with (cwd / output_file).open("w") as destination:
-            result = subprocess.run(command, cwd=cwd, text=True, stdout=destination,
-                                    stderr=subprocess.PIPE, timeout=timeout, check=False)
-    except subprocess.TimeoutExpired as error:
-        raise ValueError(f"Tool timed out after {timeout}s: {command[0]}") from error
-    if result.returncode:
-        (cwd / output_file).unlink(missing_ok=True)
-        raise ValueError(result.stderr[-12_000:].strip() or
-                         f"{command[0]} exited with {result.returncode}")
-    return result.stderr[-12_000:]
+# Shared runner applies limits to the entire tool process group, including descendants.
+from build_runner import run, run_to_file, BUILD_TIMEOUT, workspace_size, DISK_LIMIT
 
 
 def tcl_path(path):
@@ -420,12 +402,22 @@ class Lab:
         self.backend = None
         self.fabric = None
         self.fabric_armed = False
+        self.active_job = None
+        self.request_busy = False
+        self.deadline = None
+        self.progress = None
 
     def run(self, command, timeout=120):
-        return run(self.sandbox_command(command), cwd=self.work, timeout=timeout)
+        if self.progress:
+            self.progress(f"Running {Path(command[0]).name}…\n")
+        return run(self.sandbox_command(command), cwd=self.work, timeout=timeout,
+                   deadline=self.deadline, progress=self.progress)
 
     def run_to_file(self, command, output_file, timeout=120):
-        return run_to_file(self.sandbox_command(command), output_file, cwd=self.work, timeout=timeout)
+        if self.progress:
+            self.progress(f"Running {Path(command[0]).name}…\n")
+        return run_to_file(self.sandbox_command(command), output_file, cwd=self.work, timeout=timeout,
+                           deadline=self.deadline, progress=self.progress)
 
     def sandbox_command(self, command):
         # HDL can read files with `include/$readmemh/$fopen. Hide sibling workspaces
@@ -433,6 +425,7 @@ class Lab:
         bwrap = shutil.which("bwrap")
         if not bwrap:
             raise ValueError("Bubblewrap (bwrap) is required to isolate FPGA builds")
+        (self.work / "tmp").mkdir(exist_ok=True)
         args = [bwrap, "--die-with-parent", "--unshare-all", "--cap-drop", "ALL"]
         # Start with an empty filesystem. Only public system/toolchain files and
         # this lab's writable directory are visible, never host home or siblings.
@@ -441,13 +434,16 @@ class Lab:
         paths = openxc7_paths(self.board)
         if paths:
             roots.extend((paths["root"].resolve(), paths["family"].resolve()))
+        roots.extend(getattr(self, "decoder_mounts", []))
         for root in dict.fromkeys(roots):
             if root.exists():
                 args += ["--ro-bind", str(root), str(root)]
-        args += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp",
-                 "--tmpfs", "/var/tmp", "--bind", str(self.work), str(self.work),
+        args += ["--proc", "/proc", "--dev", "/dev", "--dir", "/tmp", "--dir", "/var/tmp",
+                 "--bind", str(self.work / "tmp"), "/tmp",
+                 "--bind", str(self.work / "tmp"), "/var/tmp", "--bind", str(self.work), str(self.work),
                  "--chdir", str(self.work), "--clearenv", "--setenv", "PATH", os.defpath,
-                 "--setenv", "HOME", "/tmp", "--setenv", "LANG", "C.UTF-8", "--", *command]
+                 "--setenv", "HOME", "/tmp", "--setenv", "LANG", "C.UTF-8",
+                 "--setenv", "OMP_NUM_THREADS", "2", "--", *command]
         return args
 
     def close(self):
@@ -508,7 +504,7 @@ class Lab:
                                        "samples": [item["values"] for item in capture["samples"][-128:]]}
         artifact_names = [name for name in ("design.v", "adapter.v", "clock_adapter.v", "board.xdc", "netlist.json",
                           "xc7_netlist.json", "routed.json", "design.fasm", "design.frames",
-                          "route.log", "synth.rpt", "timing.rpt", "routed.dcp", "design.bit")
+                          "route.log", "synth.rpt", "timing.rpt", "routed.dcp", "design.bit", "user_design.v", "testbench.v", "testbench.vcd")
                           if (self.work / name).is_file() and (name != "design.bit" or self.bitstream)]
         return {"phase": self.phase, "top": self.top, "buildTop": self.build_top,
                 "mappingSummary": self.mapping_summary,
@@ -534,8 +530,8 @@ class Lab:
                 "fabricWaveform": fabric_waveform, "artifacts": artifact_names}
 
     def synthesize(self, code, top, clock_hz=BOARD_CLOCK_HZ):
-        if not isinstance(code, str) or not 1 <= len(code) <= MAX_SOURCE:
-            raise ValueError("Verilog source must be between 1 and 100,000 characters")
+        if not isinstance(code, str) or not 1 <= len(code.encode("utf-8")) <= MAX_SOURCE:
+            raise ValueError("Verilog source must be between 1 and 100,000 UTF-8 bytes")
         clock_divider(clock_hz)
         top = resolve_top(code, top)
         if not tool_path("yosys"):
@@ -734,29 +730,60 @@ endmodule
             raise ValueError("The bitstream tool did not produce design.bit")
         self.phase, self.bitstream = "bitstream", True
         self.log = "Artix-7 bitstream generated: design.bit\n" + output[-11_000:]
-        if self.board != "basys3" or self.clock_hz != BOARD_CLOCK_HZ:
-            detail = ("the fabric decoder currently supports Basys 3 only" if self.board != "basys3"
-                      else "a divided clock needs too many 100 MHz source cycles for live fabric playback")
-            self.log = (f"Bitstream generated. The board LEDs and waveform use RTL simulation; "
-                        f"{detail}.\n" + self.log)
+        if self.clock_hz != BOARD_CLOCK_HZ:
+            self.log = "Bitstream generated. A divided clock uses RTL playback.\n" + self.log
             return self.snapshot()
         try:
             if importlib.util.find_spec("fasm") is None or importlib.util.find_spec("fasm2bels") is None:
                 raise ModuleNotFoundError(
-                    "Basys 3 decoder needs fasm and fasm2bels. Install requirements.txt "
+                    "Decoder needs fasm and fasm2bels. Install requirements-decoder.txt "
                     "in the Python environment running this server")
             for name in ("sim-core", "bitstream-decode"):
                 path = str(ROOT / name)
                 if path not in sys.path:
                     sys.path.insert(0, path)
             from runtime import BoardRuntime
-            self.fabric = BoardRuntime(program_root=self.work / "programs")
+            from pipeline import database_root
+            config = BOARDS[self.board]
+            database = database_root(config["part"])
+            cache = ROOT / ".tools/decoder" / f"{config['part']}.db"
+            if not cache.is_file():
+                raise FileNotFoundError("Prepare the trusted decoder cache; see docs/DEPLOY.md")
+            self.decoder_mounts = [ROOT / "bitstream-decode", Path(sys.prefix), database, cache]
+            def convert(capture, output):
+                self.run([sys.executable, str(ROOT / "bitstream-decode/pipeline.py"), str(capture),
+                          "--output", str(output), "--part", config["part"], "--db-root", str(database),
+                          "--connection-database", str(cache), "--yosys", tool_path("yosys")], timeout=1200)
+                return output / "netlist.json"
+            self.fabric = BoardRuntime(program_root=self.work / "programs", part=config["part"],
+                                       master_xdc=self.work / "board.xdc", switch_count=config["switches"],
+                                       led_count=config["leds"], buttons=config["buttons"], converter=convert,
+                                       db_root=database,
+                                       button_ports={name: f"btn[{i}]" for i, name in enumerate(config["buttons"])}
+                                       if "btn" in self.ports else None)
             self.fabric_armed = False
             self.fabric.control({"switches": self.switches, "running": False})
-            self.fabric.programmed((self.work / "design.bit").read_bytes())
+            self.fabric.programmed((self.work / "design.bit").read_bytes(), synchronous=True)
             self.log = "Bitstream generated. Decoding the programmed fabric for the board display.\n" + self.log
         except Exception as error:
             self.log = f"Bitstream generated; fabric decoder unavailable: {error}\n" + self.log
+        return self.snapshot()
+
+    def testbench(self, code, testbench, top="tb"):
+        for source in (code, testbench):
+            if not isinstance(source, str) or not 1 <= len(source.encode("utf-8")) <= MAX_SOURCE:
+                raise ValueError("Source must be between 1 and 100,000 UTF-8 bytes")
+        if not isinstance(top, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", top):
+            raise ValueError("Invalid testbench module name")
+        if not tool_path("iverilog") or not tool_path("vvp"):
+            raise ValueError("Icarus Verilog is required for testbenches")
+        for name in ("testbench.vcd", "testbench.vvp", "user_design.v", "testbench.v"):
+            (self.work / name).unlink(missing_ok=True)
+        (self.work / "user_design.v").write_text(code)
+        (self.work / "testbench.v").write_text(testbench)
+        self.run([tool_path("iverilog"), "-g2012", "-s", top, "-o", "testbench.vvp", "user_design.v", "testbench.v"])
+        output = self.run([tool_path("vvp"), "testbench.vvp"], timeout=30)
+        self.log = "Testbench completed.\n" + output[-11000:]
         return self.snapshot()
 
     def control(self, payload):
@@ -782,8 +809,16 @@ endmodule
         count = payload.get("step", 1)
         if type(count) is not int or not 1 <= count <= 32:
             raise ValueError("Step must be 1–32 cycles")
-        for _ in range(count):
-            self.add_sample()
+        if len(self.samples) + count > MAX_PREVIEW_CYCLES:
+            raise ValueError(f"Preview reached {MAX_PREVIEW_CYCLES} cycles. Choose Implement to restart the capture.")
+        button_word = sum(value << index for index, value in enumerate(self.buttons.values()))
+        self.samples.extend({"switches": self.switches, "buttons": button_word, "leds": "xxxx"} for _ in range(count))
+        previous_deadline = self.deadline
+        self.deadline = min(previous_deadline or float("inf"), time.monotonic() + 5)
+        try:
+            self.simulate()
+        finally:
+            self.deadline = previous_deadline
         return self.snapshot()
 
 
@@ -811,7 +846,7 @@ class SessionStore:
         return hashlib.sha256(token.encode()).hexdigest()
 
     @contextmanager
-    def acquire(self, token, create=False):
+    def acquire(self, token, create=False, lock_lab=True):
         now = time.monotonic()
         expired = []
         with self.lock:
@@ -846,13 +881,139 @@ class SessionStore:
         if error:
             raise error
         try:
-            with entry["lab"].lock:
+            with entry["lab"].lock if lock_lab else nullcontext():
                 yield entry["lab"], token if fresh else None
         finally:
             with self.lock:
                 entry["active"] -= 1
                 entry["seen"] = time.monotonic()
 
+
+class JobStore:
+    """One worker; jobs are private to a session and pinned until completion."""
+    def __init__(self, depth=None, retention=3600):
+        self.depth = depth if depth is not None else int(os.environ.get("BUILD_QUEUE_DEPTH", "4"))
+        if not 1 <= self.depth <= 64:
+            raise ValueError("BUILD_QUEUE_DEPTH must be between 1 and 64")
+        self.retention = retention
+        self.lock = threading.RLock()
+        self.queue = queue.Queue(maxsize=self.depth)
+        self.jobs = {}
+        self.rates = {}
+        self.worker = None
+
+    def _prune(self):
+        now = time.monotonic()
+        for key, job in list(self.jobs.items()):
+            if job["status"] in ("succeeded", "failed") and now - job["finished"] > self.retention:
+                del self.jobs[key]
+        for ip, hits in list(self.rates.items()):
+            if not hits or now - hits[-1] >= 60:
+                del self.rates[ip]
+
+    def submit(self, store, token, lab, action, payload, ip):
+        with self.lock:
+            self._prune()
+            if lab.active_job or lab.request_busy:
+                raise SessionError("This workspace already has an active build.", 409)
+            if len(self.jobs) >= 256:
+                completed = [key for key, job in self.jobs.items() if job["status"] in ("succeeded", "failed")]
+                if completed:
+                    del self.jobs[min(completed, key=lambda key: self.jobs[key]["finished"])]
+            if self.queue.full() or len(self.jobs) >= 256:
+                raise SessionError("Build queue is full. Try again shortly.", 429)
+            now = time.monotonic()
+            hits = self.rates.setdefault(ip, deque())
+            while hits and now - hits[0] >= 60:
+                hits.popleft()
+            if len(hits) >= int(os.environ.get("BUILDS_PER_MINUTE", "6")):
+                raise SessionError("Build rate limit reached. Try again in a minute.", 429)
+            if not hits and len(self.rates) > 4096:
+                self.rates.pop(ip, None)
+                raise SessionError("Too many build clients. Try again shortly.", 429)
+            key = store.key(token)
+            job_id = secrets.token_urlsafe(24)
+            job = {"id": job_id, "owner": key, "action": action, "status": "queued",
+                   "log": "Waiting for the build worker.", "created": now, "result": None}
+            # Retain the session while queued/running, even if its browser leaves.
+            with store.lock:
+                store.entries[key]["active"] += 1
+            lab.active_job = job_id
+            job["initial"] = lab.snapshot()
+            self.jobs[job_id] = job
+            hits.append(now)
+            self.queue.put_nowait((job, store, lab, payload))
+            if self.worker is None:
+                self.worker = threading.Thread(target=self._work, daemon=True, name="build-worker")
+                self.worker.start()
+            return self.snapshot(job_id, key)
+
+    def snapshot(self, job_id, owner):
+        with self.lock:
+            self._prune()
+            job = self.jobs.get(job_id)
+            if job is None or job["owner"] != owner:
+                raise SessionError("Job not found.", 404)
+            with self.queue.mutex:
+                waiting = list(self.queue.queue)
+            position = next((i + 1 for i, item in enumerate(waiting) if item[0] is job), 0)
+            return {"jobId": job["id"], "status": job["status"], "action": job["action"],
+                    "queuePosition": position, "log": job["log"],
+                    "elapsedSeconds": round(job.get("finished", time.monotonic()) - job.get("started", job["created"])),
+                    "error": job.get("error"), "result": job["result"]}
+
+    def _progress(self, job, chunk):
+        with self.lock:
+            job["log"] = (job["log"] + chunk)[-12000:]
+
+    def _work(self):
+        while True:
+            job, store, lab, payload = self.queue.get()
+            try:
+                with lab.lock:
+                    with self.lock:
+                        job.update(status="running", started=time.monotonic(), log="Build started.\n")
+                    lab.deadline = time.monotonic() + BUILD_TIMEOUT
+                    lab.progress = lambda chunk: self._progress(job, chunk)
+                    try:
+                        action = job["action"]
+                        if action == "synthesize":
+                            result = lab.synthesize(payload.get("code"), payload.get("top"), payload.get("clockHz", BOARD_CLOCK_HZ))
+                        elif action == "implement":
+                            result = lab.implement(payload.get("switches"))
+                        elif action == "testbench":
+                            result = lab.testbench(payload.get("code"), payload.get("testbench"), payload.get("top", "tb"))
+                        else:
+                            result = lab.generate()
+                        with self.lock:
+                            job.update(status="succeeded", result=result, finished=time.monotonic())
+                    except Exception as error:
+                        lab.log = str(error)
+                        if job["action"] == "synthesize":
+                            lab.phase, lab.backend, lab.gates, lab.ports = "ready", None, None, {}
+                            for name in ("adapter.v", "clock_adapter.v", "netlist.json", "user_netlist.json", "board.xdc",
+                                         "xc7_netlist.json", "routed.json", "design.fasm", "design.frames", "route.log",
+                                         "synth.rpt", "synth.dcp", "timing.rpt", "routed.dcp", "sim.vvp"):
+                                (lab.work / name).unlink(missing_ok=True)
+                        if job["action"] != "testbench":
+                            lab.bitstream = False
+                            (lab.work / "design.bit").unlink(missing_ok=True)
+                        with self.lock:
+                            job.update(status="failed", error=str(error), result=lab.snapshot(), finished=time.monotonic())
+                    finally:
+                        lab.deadline = lab.progress = None
+                        with self.lock:
+                            job["finished"] = time.monotonic()
+                            lab.active_job = None
+            finally:
+                with store.lock:
+                    entry = store.entries[job["owner"]]
+                    entry["active"] -= 1
+                    entry["seen"] = time.monotonic()
+                self.queue.task_done()
+
+
+JOBS = JobStore()
 
 SESSIONS = SessionStore(WORK / "sessions")
 MIME = {".html": "text/html; charset=utf-8", ".css": "text/css; charset=utf-8",
@@ -877,7 +1038,8 @@ class Handler(BaseHTTPRequestHandler):
         if filename:
             self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
         self.end_headers()
-        self.wfile.write(data)
+        if self.command != "HEAD":
+            self.wfile.write(data)
 
     def session_token(self):
         cookie = SimpleCookie()
@@ -908,8 +1070,35 @@ class Handler(BaseHTTPRequestHandler):
         return not origin or (urlsplit(origin).netloc == self.headers.get("Host")
                               and urlsplit(origin).scheme in ("http", "https")) or origin in allowed
 
+    def authorized(self):
+        secret = os.environ.get("BACKEND_SECRET", "")
+        if secret:
+            return hmac.compare_digest(self.headers.get("X-Backend-Secret", "").encode(), secret.encode())
+        return (self.client_address[0] in ("127.0.0.1", "::1")
+                and not os.environ.get("ALLOWED_ORIGINS")
+                and not self.headers.get("X-Forwarded-For")
+                and not self.headers.get("X-Forwarded-Proto")
+                and not self.headers.get("CF-Connecting-IP"))
+
+    def require_auth(self):
+        if self.authorized():
+            return True
+        self.send_data({"error": "Backend authentication required"}, status=403)
+        return False
+
+    def client_ip(self):
+        # Only the authenticated proxy supplies this header; ignore generic forwarded headers.
+        if os.environ.get("BACKEND_SECRET"):
+            return self.headers.get("X-Build-Client-IP", self.client_address[0])[:64]
+        return self.client_address[0]
+
+    def do_HEAD(self):
+        self.do_GET()
+
     def do_GET(self):
         path = urlsplit(self.path).path
+        if (path.startswith("/api/") or path == "/healthz") and not self.require_auth():
+            return
         if path in ("/api/health", "/healthz"):
             self.send_data({"ok": True})
             return
@@ -917,23 +1106,43 @@ class Handler(BaseHTTPRequestHandler):
             if not self.valid_origin():
                 self.send_data({"error": "Cross-origin request rejected"}, status=403)
                 return
-            if path not in ("/api/session", "/api/source", "/api/status") and not path.startswith("/api/artifact/"):
+            if path not in ("/api/session", "/api/source", "/api/status") and not path.startswith(("/api/artifact/", "/api/jobs/")):
                 self.send_data({"error": "Not found"}, status=404)
                 return
             try:
                 # /source also bootstraps older deployed clients, but only ever
                 # returns the public starter design to a visitor without a cookie.
-                with SESSIONS.acquire(self.session_token(), create=path in ("/api/session", "/api/source")) as (lab, token):
+                with SESSIONS.acquire(self.session_token(), create=path in ("/api/session", "/api/source"), lock_lab=False) as (lab, token):
                     if token:
                         self.set_session_cookie(token)
                     if path == "/api/session":
                         self.send_data({"ok": True})
                     elif path == "/api/source":
                         self.send_data({"code": lab.code, "top": lab.top})
+                    elif path.startswith("/api/jobs/"):
+                        self.send_data(JOBS.snapshot(path.removeprefix("/api/jobs/"), SESSIONS.key(self.session_token())))
                     elif path == "/api/status":
-                        self.send_data(lab.snapshot())
+                        with JOBS.lock:
+                            job_id = lab.active_job
+                            if job_id:
+                                job = JOBS.jobs[job_id]
+                                result = {**job["initial"], "job": JOBS.snapshot(job_id, job["owner"])}
+                            else:
+                                # Never wait for a build that was enqueued during this read.
+                                if not lab.lock.acquire(blocking=False):
+                                    raise SessionError("Workspace busy. Retry shortly.", 409)
+                                try:
+                                    result = lab.snapshot()
+                                finally:
+                                    lab.lock.release()
+                        self.send_data(result)
                     else:
-                        self.send_artifact(lab, path.removeprefix("/api/artifact/"))
+                        with JOBS.lock:
+                            if lab.active_job:
+                                raise SessionError("Build in progress. Download artifacts when it finishes.", 409)
+                            with lab.lock:
+                                artifact = self.read_artifact(lab, path.removeprefix("/api/artifact/"))
+                        self.send_data(*artifact[0], **artifact[1])
             except SessionError as error:
                 self.send_data({"error": str(error)}, status=error.status)
             return
@@ -954,29 +1163,30 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.send_data({"error": "Not found"}, status=404)
 
-    def send_artifact(self, lab, name):
+    def read_artifact(self, lab, name):
         allowed = {"design.v", "adapter.v", "clock_adapter.v", "board.xdc", "netlist.json", "xc7_netlist.json",
                    "routed.json", "design.fasm", "design.frames", "route.log", "synth.rpt",
-                   "timing.rpt", "routed.dcp", "design.bit"}
+                   "timing.rpt", "routed.dcp", "design.bit", "user_design.v", "testbench.v", "testbench.vcd"}
         file = lab.work / name
         if name not in allowed or file.is_symlink() or not file.is_file() or (name == "design.bit" and not lab.bitstream):
-            self.send_data({"error": "Artifact not found"}, status=404)
-            return
+            return (({"error": "Artifact not found"},), {"status": 404})
         kind = ("text/plain; charset=utf-8" if file.suffix in
                 (".v", ".xdc", ".rpt", ".json", ".fasm", ".frames", ".log")
                 else "application/octet-stream")
-        self.send_data(file.read_bytes(), kind, filename=name)
+        return ((file.read_bytes(), kind), {"filename": name})
 
     def do_POST(self):
         path = urlsplit(self.path).path
-        if path not in ("/api/board", "/api/synthesize", "/api/implement", "/api/bitstream", "/api/control"):
+        if not self.require_auth():
+            return
+        if path not in ("/api/board", "/api/synthesize", "/api/implement", "/api/bitstream", "/api/control", "/api/testbench"):
             self.send_data({"error": "Not found"}, status=404)
             return
         if not self.valid_origin():
             self.send_data({"error": "Cross-origin request rejected"}, status=403)
             return
         try:
-            with SESSIONS.acquire(self.session_token()) as (lab, _):
+            with SESSIONS.acquire(self.session_token(), lock_lab=False) as (lab, _):
                 self.post_to_lab(lab, path)
         except SessionError as error:
             self.send_data({"error": str(error)}, status=error.status)
@@ -984,36 +1194,38 @@ class Handler(BaseHTTPRequestHandler):
     def post_to_lab(self, lab, path):
         try:
             length = int(self.headers.get("Content-Length", "0"))
-            if not 1 <= length <= MAX_SOURCE + 10_000:
+            if not 1 <= length <= MAX_REQUEST:
                 raise ValueError("Invalid request size")
             if self.headers.get_content_type() != "application/json":
                 raise ValueError("Expected JSON")
             payload = json.loads(self.rfile.read(length))
             if not isinstance(payload, dict):
                 raise ValueError("Expected an object")
-            if path == "/api/board":
-                result = lab.select_board(payload.get("board"))
-            elif path == "/api/synthesize":
-                result = lab.synthesize(payload.get("code"), payload.get("top"),
-                                        payload.get("clockHz", BOARD_CLOCK_HZ))
-            elif path == "/api/implement":
-                result = lab.implement(payload.get("switches"))
-            elif path == "/api/bitstream":
-                result = lab.generate()
-            else:
-                result = lab.control(payload)
-            self.send_data(result)
+            with JOBS.lock:
+                if getattr(lab, "active_job", None) or getattr(lab, "request_busy", False):
+                    raise SessionError("This workspace already has an active build.", 409)
+                if path in ("/api/synthesize", "/api/implement", "/api/bitstream", "/api/testbench"):
+                    if path in ("/api/synthesize", "/api/testbench"):
+                        for field in (("code", "testbench") if path == "/api/testbench" else ("code",)):
+                            code = payload.get(field)
+                            if not isinstance(code, str) or not 1 <= len(code.encode("utf-8")) <= MAX_SOURCE:
+                                raise ValueError("Source must be between 1 and 100,000 UTF-8 bytes")
+                    result = JOBS.submit(SESSIONS, self.session_token(), lab, path.removeprefix("/api/"), payload, self.client_ip())
+                    response_status = 202
+                else:
+                    # Reserve this lab without holding the global job lock during tools.
+                    lab.request_busy = True
+                    result = None
+                    response_status = 200
+            if result is None:
+                try:
+                    with lab.lock:
+                        result = lab.select_board(payload.get("board")) if path == "/api/board" else lab.control(payload)
+                finally:
+                    with JOBS.lock:
+                        lab.request_busy = False
+            self.send_data(result, status=response_status)
         except (ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
-            if path == "/api/synthesize":
-                lab.phase = "ready"
-                lab.backend = None
-                lab.gates = None
-                lab.ports = {}
-                for name in ("adapter.v", "clock_adapter.v", "netlist.json", "user_netlist.json", "board.xdc",
-                             "xc7_netlist.json", "routed.json", "design.fasm", "design.frames", "route.log",
-                             "synth.rpt", "synth.dcp", "timing.rpt", "routed.dcp", "design.bit", "sim.vvp"):
-                    (lab.work / name).unlink(missing_ok=True)
-            lab.log = str(error)
             self.send_data({"error": str(error)}, status=400)
 
     def log_message(self, format, *args):
@@ -1025,5 +1237,7 @@ if __name__ == "__main__":
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     args = parser.parse_args()
+    if not os.environ.get("BACKEND_SECRET") and (args.host not in ("127.0.0.1", "::1") or os.environ.get("ALLOWED_ORIGINS")):
+        parser.error("BACKEND_SECRET is required for a public/proxied backend")
     print(f"FPGA workbench: http://{args.host}:{args.port}", flush=True)
     ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()

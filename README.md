@@ -1,12 +1,15 @@
 # FPGA Workbench
 
+![FPGA Workbench running a counter on the virtual Basys 3 with a captured waveform](docs/images/workbench.png)
+
 A browser workbench for editing Verilog, synthesizing it, choosing virtual switch inputs, viewing LEDs and waveforms, and generating an Artix-7 `.bit` with the open XC7 toolchain or Vivado. Select Basys 3, Nexys A7 100T, or Arty A7 100T in the header. The Basys 3 fabric model is included here and comes from [virtual-basys3](https://github.com/xp4t/virtual-basys3).
 
 ## Run locally
 
-On Linux, install `yosys`, `iverilog`, `vvp`, and Bubblewrap (`bwrap`) on your path.
+On Linux, install `yosys`, `iverilog`, `vvp`, Bubblewrap (`bwrap`), and `prlimit`
+(from `util-linux`) on your path. Use Python 3.11 or newer.
 Unprivileged user namespaces must be available; builds fail closed if the sandbox
-cannot start. For Basys 3 bitstream decoding, also install the Python dependencies into a local environment:
+cannot start. Create a local Python environment:
 
 ```sh
 python3 -m venv .venv
@@ -19,16 +22,8 @@ Then run:
 .venv/bin/python server.py
 ```
 
-For the optional Basys 3 bitstream decoder, install the Python dependencies in a Python 3.9 environment:
-
-```sh
-conda create -n fpga-playground python=3.9 pip
-conda activate fpga-playground
-python -m pip install -r requirements.txt
-python server.py
-```
-
-The pinned FPGA Interchange dependency requires `pycapnp==1.1.0`. That release and the pinned `fasm` release provide Linux x86-64 wheels for Python 3.9, but not Python 3.13. Installing with the Python 3.13 Conda base environment tries to compile the older `pycapnp` source and fails during Cython compilation.
+The core server supports Python 3.11 and newer and needs no pip packages. Optional
+bitstream decoding has a separate environment; see [decoder setup](docs/DEPLOY.md#optional-bitstream-decoder).
 
 Open <http://127.0.0.1:8000>. The default counter is ready to edit. **Synthesize** runs Yosys. **Implement** asks for a switch word sized to the selected board, starts an Icarus Verilog RTL simulation for the board and waveform, then places and routes the design when an Artix-7 backend is installed. The virtual board can then be stepped, run, and controlled with switches and pushbuttons. The switch word sets simulated input pins; it is not baked into the bitstream. Changing boards clears the current build artifacts but keeps the editor source.
 
@@ -36,190 +31,43 @@ The local preview records up to 4096 clock cycles per implementation. Choose **I
 
 The board clock input is 100 MHz. The **Clock** control offers 100, 50, and 25 MHz presets and a logarithmic slider from 25 MHz down to 1 Hz. For a design with a `clk` input, lower settings synthesize a counter divider into the bitstream. Some slider values round to the nearest rate achievable by an integer divider; the interface shows that actual rate. Changing the clock requires **Synthesize**, **Implement**, and **Generate .bit** again. The RTL preview advances one selected clock edge per sample; browser playback runs at the selected rate up to 20 cycles per second, rather than trying to animate millions of cycles per second. A design without `clk` has no clock to divide.
 
-## Connect a Vercel frontend to a backend
+## Hosting and resource limits
 
-`vercel.json` deploys the frontend and a small Node.js availability function. Until an API route is configured,
-`/api/source` and `/api/status` return a Vercel error page instead of JSON.
-The interface reports that the backend is not connected.
+The editor is static and stays available when the build server is offline. It keeps
+Verilog and testbench drafts in browser storage and lets you download your source.
+Build controls reconnect automatically when the backend returns.
 
-### Free hosted RTL preview on Render
+Synthesis, implementation, bitstream generation, and custom testbenches return
+**HTTP 202 with a job ID**. One worker runs the queued build; the browser polls its
+private job for state, elapsed time, queue position, and tool output. Reloading a
+page resumes an active job. Sessions and jobs are temporary and reset on backend
+restart; jobs are retained for one hour after completion.
 
-The included `Dockerfile` installs Python, Yosys, Icarus Verilog, and Bubblewrap and runs as
-an unprivileged user. It supports synthesis, board simulation, and waveforms.
-It does not install open XC7, Vivado, or the optional bitstream decoder. The host
-must permit Bubblewrap's user namespaces inside the container. Hosted services
-that prohibit them cannot run builds with this configuration; use the Linux PC
-backend below instead of disabling isolation.
+Public API traffic passes through a Vercel function that injects a private
+`X-Backend-Secret` header. The Python backend rejects missing or incorrect secrets,
+even with a forged browser Origin. Defaults allow one active job per workspace,
+four waiting builds, and six build submissions per minute per IP. Tool processes
+inherit memory, CPU, and file-size limits; wall-time and workspace checks terminate
+the process group. The provided systemd service adds aggregate CPU/RAM/task limits
+and a bounded ephemeral filesystem for all sessions.
 
-1. Push the updated repository to GitHub.
-2. On Render, create a **Web Service**, connect the repository, choose the
-   **Docker** runtime, use the repository root and `Dockerfile`, and select **Free**.
-3. Add the backend environment variable
-   `ALLOWED_ORIGINS=https://fpga-playground.vercel.app`.
-   Multiple exact origins can be separated by commas. Add preview deployment
-   origins explicitly when needed. This is origin validation, not authentication.
-4. Keep the Docker command unchanged; it binds to `0.0.0.0` and honors Render's
-   `PORT` environment variable. Use `/api/health` as the health check path.
-5. Wait for the service to deploy. Open
-   `https://YOUR-SERVICE.onrender.com/api/status` and confirm it returns JSON.
-6. Update only the external API destination in the existing `vercel.json`,
-   retaining the other rewrites and settings, then push to redeploy Vercel:
+See [docs/DEPLOY.md](docs/DEPLOY.md) for Vercel environment variables, a named
+Cloudflare tunnel, service configuration, quota tuning, Render RTL hosting, and
+migration from the retired Quick Tunnel/cron workflow. No Vercel credentials are
+needed on the build machine.
 
-```json
-{
-  "source": "/api/:path*",
-  "destination": "https://YOUR-SERVICE.onrender.com/api/:path*"
-}
-```
+For `fpgaplayground.com` with AWS EC2 running the tools, use the self-contained
+[fpgapg-ws deployment folder and complete setup guide](fpgapg-ws/README.md).
 
-The browser continues to call its own `/api` paths, including artifact downloads;
-Vercel forwards them to Render. This workflow does not require browser CORS
-headers. `ALLOWED_ORIGINS` allows the original frontend origin on proxied POSTs.
-Open the Vercel site's `/api/status` after redeployment and confirm it returns JSON.
+## Custom testbenches
 
-[Render's free services](https://render.com/docs/free) sleep after 15 minutes of
-inactivity and lose generated files and in-memory state on restart, redeploy, or
-sleep. The [free compute plan](https://render.com/docs/compute-plans) provides
-512 MB RAM and 0.1 CPU. Use this setup for small, temporary RTL demonstrations;
-it is not a suitable default for Artix-7 placement and routing.
-
-### Full FPGA tools on your Linux x86-64 computer
-
-For development, an existing Linux computer can provide the backend compute.
-Install `yosys` and `iverilog`, optionally run `./scripts/install_openxc7.sh` for
-bitstream builds, and start the updated backend:
-
-```sh
-ALLOWED_ORIGINS=https://fpga-playground.vercel.app \
-  python3 server.py --host 127.0.0.1 --port 8000
-```
-
-After installing the open source
-[`cloudflared` client](https://github.com/cloudflare/cloudflared), a temporary
-[Quick Tunnel](https://developers.cloudflare.com/tunnel/get-started/quick-tunnels/)
-can expose this local server over HTTPS for testing:
-
-```sh
-cloudflared tunnel --url http://127.0.0.1:8000
-```
-
-Use the printed `https://...trycloudflare.com` hostname as the rewrite destination,
-retaining `/api/:path*`. The machine, server, and tunnel must remain running.
-Quick Tunnel hostnames change whenever the tunnel restarts. For a stable address,
-configure a named tunnel with a domain you control or a Linux server with HTTPS.
-
-### This PC's installed backend
-
-The local deployment keeps its Python environment, FPGA tools, and tunnel client
-under `.tools/` (excluded from Git and Vercel uploads). Start the detached server
-and HTTPS tunnel with:
-
-```sh
-bash scripts/start_pc_backend.sh
-```
-
-This installation pairs open XC7 `2026-09-24` with its required YosysHQ
-OSS CAD Suite `2026-03-24`. Python 3.9 and a recent Bubblewrap are installed in
-`.tools/runtime`; the older system Python and Bubblewrap are not used.
-
-The server listens only on `127.0.0.1:8000` and allows the production frontend
-origin `https://fpga-playground.vercel.app`. Logs are in `.work/backend.log` and
-`.work/tunnel.log`. These processes survive closing the terminal.
-
-Boot startup is installed in this user's crontab with:
-
-```sh
-.tools/runtime/bin/python scripts/pc_boot.py --install
-```
-
-The system's enabled cron service runs `scripts/boot_pc_backend.sh` at boot,
-before a desktop login, and checks every minute. It starts missing processes
-and retries if the network is still coming up. No sudo password is needed.
-The installer manages only this project's marked entries and preserves other
-cron jobs, including unrelated entries inside those markers.
-When a Quick Tunnel gets a new hostname, the job checks its health, updates
-only the external API rewrite, and redeploys the existing `fpga-pg/fpga-playground`
-Vercel project using the saved CLI login. Deployments are non-interactive, and
-a lock prevents overlapping startup/deployment jobs. If the Vercel login is
-revoked, the backend still starts but website reconnection requires renewing
-that Vercel login. Logs are in `.work/boot.log`. Run the boot script manually
-to perform the same check immediately. For an address that survives tunnel
-restarts without a Vercel redeployment, use a named Cloudflare tunnel with a
-domain you own. The home filesystem must be available at boot (as it is on
-this PC); a home directory encrypted until login would prevent this setup.
-
-Only frontend assets, `api/availability.js`, and `vercel.json` are uploaded by
-the Vercel CLI, as specified by `.vercelignore`. Local toolchains, workspace
-files, account credentials, and the Python backend stay on this PC.
-
-Anyone can run their own copy of a public repository. Replacing this website's
-backend requires changing the owning Vercel project or its connected repository
-with authorized credentials; a clone does not grant that access. Vercel's fork
-protection is enabled on the existing project.
-
-### Private browser workspaces
-
-Each browser session has its own `Lab`, lock, randomly named directory under
-`.work/sessions/`, RTL, logs, board state, waveform, and artifacts. A server-issued
-256-bit random cookie selects the session. It is host-only, HttpOnly, SameSite=Strict,
-and Secure when served through the HTTPS proxy. Session tokens never appear in
-artifact URLs or filesystem paths. Vercel must forward cookies and `Set-Cookie`;
-API responses carry `Cache-Control: no-store`, `CDN-Cache-Control: no-store`, and
-`Vary: Cookie`.
-
-The frontend first calls `/api/session`, then loads source and status. Requests to
-state-changing endpoints and downloads without a valid session return 401.
-For older clients, `/api/source` can create a session, returning only the public
-starter design. There is no fallback to the former global workbench. Old browser
-drafts from the shared-workbench version are not imported automatically.
-
-FPGA tools run in Bubblewrap with only system/toolchain files mounted read-only
-and the current workspace writable. Other workspaces, the host home directory,
-and the network are unavailable to HDL file-reading commands. Decoder outputs
-are also stored inside the session workspace.
-
-Sessions expire after 24 hours without workspace requests and are cleaned up on
-later workspace requests; active requests pin their session until completion.
-At most 64 sessions are retained at once. A backend restart invalidates sessions;
-old on-disk directories are never reattached to a visitor. The editor keeps new
-drafts in browser-local storage, so users can resynthesize after a restart.
-Tabs in one browser profile share that browser's session; another browser,
-profile, or device gets a separate workspace. This is anonymous session isolation,
-not a login system or durable account storage. Public deployments still need
-authentication and resource quotas to control who can submit builds.
-
-Test isolation with `python3 -m unittest discover -s tests -p test_sessions.py -v`.
-
-The build endpoints are currently synchronous and can run for many minutes.
-[Vercel external rewrites](https://vercel.com/docs/limits) time out after 120 seconds.
-Reliable long builds require a background job API that returns a job ID promptly,
-with a worker performing builds and the frontend polling progress. Changing the
-backend hostname alone does not solve this timeout.
-
-### When the backend PC is offline
-
-Vercel checks the lightweight `/api/health` endpoint before serving the homepage.
-If the PC, server, or tunnel is unavailable (including a four-second timeout),
-the homepage returns **HTTP 503 Service Unavailable**, with `Retry-After: 30`
-and an offline page hosted on Vercel. The page retries every 30 seconds and
-automatically opens the workbench when the server returns. `/healthz` exposes
-the same availability check as JSON. Responses are not cached.
-
-Already-open workbenches check every 30 seconds, pause playback and disable builds
-during an outage, and keep the editor available. Reconnecting refreshes backend
-state while preserving the editor contents. Health checks do not acquire the
-build lock, so a long build does not itself mean the PC is offline.
-
-Keep the homepage and `/healthz` rewrites before the external API rewrite.
-The availability function reads the backend hostname from that API rewrite;
-update it and redeploy when a Quick Tunnel hostname changes. Restart `server.py`
-after updating it to enable `/api/health`.
-
-Verify outage handling with `node --test tests/test_availability.cjs` and
-`python3 -m unittest discover -s tests -p test_health.py -v`.
-
-To verify the connection handling, run `node tests/test_api.cjs` and
-`python3 -m unittest discover -s tests -p test_http.py -v`.
+Open the **Testbench** tab, paste an Icarus-compatible Verilog/SystemVerilog
+bench, and choose its top module (default `tb`). **Run testbench** compiles the
+current editor source together with your bench, independently of the board build.
+Use `$finish` to end simulation and `$dumpfile("testbench.vcd")` with `$dumpvars`
+for a downloadable VCD. Simulator output appears in Build output; `user_design.v`,
+`testbench.v`, and `testbench.vcd` appear in Artifacts. Simulation has a 30-second
+limit and shares the build queue, sandbox, and quotas.
 
 ## Generate a board bitstream
 
@@ -233,9 +81,16 @@ The installer writes to `.tools/openxc7`, which is excluded from version control
 
 With open XC7 installed, **Synthesize** maps the board design with Yosys `synth_xilinx`. **Implement** invokes `nextpnr-xilinx` to produce `routed.json` and `design.fasm`. **Generate .bit** uses `fasm2frames` and `xc7frames2bit` to produce the downloadable `design.bit`. The build artifacts include each intermediate file so you can inspect the actual output of every stage. Without an Artix-7 backend, Implement runs the RTL preview and the interface reports that bitstream generation is unavailable.
 
-Alternatively, install Vivado with support for `xc7a35tcpg236-1` and `xc7a100tcsg324-1` and put `vivado` on `PATH`, or set `VIVADO_BIN` to its executable. Vivado takes precedence when both backends are installed. The Basys 3 bitstream decoder uses the Python packages in `requirements.txt` and the Artix-7 Project X-Ray database shipped with the open XC7 toolchain. If you use Vivado without installing open XC7, set `PRJXRAY_DB_ROOT` to a compatible Artix-7 database directory containing `xc7a35tcpg236-1/part.json` and `package_pins.csv`.
+Alternatively, install Vivado with support for `xc7a35tcpg236-1` and `xc7a100tcsg324-1` and put `vivado` on `PATH`, or set `VIVADO_BIN` to its executable. Vivado takes precedence when both backends are installed. The Basys 3 bitstream decoder uses the Python packages in `requirements-decoder.txt` and the Artix-7 Project X-Ray database shipped with the open XC7 toolchain. If you use Vivado without installing open XC7, set `PRJXRAY_DB_ROOT` to a compatible Artix-7 database directory containing `xc7a35tcpg236-1/part.json` and `package_pins.csv`.
 
-The included `virtual-basys3` bitstream decoder is hardwired to the Basys 3 part and pins. On Basys 3 at 100 MHz, a supported `.bit` drives the virtual board and captured pin waveform; unsupported blocks show a decoder error while the RTL preview remains available. At lower clock settings, the real `.bit` contains the divider, but the board LEDs and waveform show RTL simulation of selected clock cycles because advancing millions of 100 MHz source cycles in the decoded fabric is impractical. On Nexys A7 100T and Arty A7 100T, the generated `.bit` is real and downloadable, while the board LEDs and waveform continue to show RTL simulation. The interface labels these cases.
+The decoder now selects the board's FPGA part, package-pin database, generated
+XDC, switch/LED widths, and button mapping. Basys 3, Nexys A7 100T, and Arty A7 100T
+can use the reconstructed fabric at 100 MHz when the optional dependencies and a
+prebuilt connection database for their part are installed. Decoder conversion
+runs inside the same sandbox and resource limits as the build. Unsupported
+primitives or incomplete database coverage retain the RTL preview and report an
+error; this remains a limited fabric simulator. Divided clocks use RTL playback
+because advancing millions of source clock edges is impractical.
 
 ### Open source tool authors
 
@@ -246,11 +101,21 @@ The included `virtual-basys3` bitstream decoder is hardwired to the Basys 3 part
 - [Project X-Ray](https://github.com/f4pga/prjxray) and its [7-series database](https://github.com/f4pga/prjxray-db), by the Project X-Ray contributors including Antmicro, Google LLC, Claire Wolf, Rick Altherr, Jake Mercer, and David Shah, document and encode the Artix-7 configuration frames.
 - The [FPGAwars open XC7 package](https://github.com/FPGAwars/tools-openxc7) was started by Juan González-Gómez, with cross-platform packaging and toolchain contributions by Carlos Venegas. It assembles these tools for the supported Artix-7 parts.
 
-The server runs FPGA tools on submitted code in isolated browser workspaces.
-It has no account authentication or CPU/disk quotas; those are separate from
-the session and filesystem isolation described above.
+## Tests and license
 
-Run the automated tool checks with `python3 -m unittest discover -s tests -v`.
+```sh
+python3 -m unittest discover -s tests -v
+node --test tests/*.cjs
+```
+
+Use Node 22 or newer. GitHub Actions runs both suites on Linux with Python 3.11,
+Yosys, Icarus, and Bubblewrap, and checks the optional decoder installation.
+Tool integration tests skip when isolation or tools are unavailable; CI first
+checks the sandbox so those RTL checks cannot silently skip.
+
+[MIT license](LICENSE). Copied board constraints retain the
+[Digilent license](boards/Digilent-License.txt); external tools and databases keep
+their upstream licenses.
 
 ## Top module and board pins
 

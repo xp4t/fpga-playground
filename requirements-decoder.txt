@@ -1,0 +1,8 @@
+# The server and RTL preview use Python's standard library. These packages
+# enable optional Artix-7 bitstream decoding. Install on Python 3.11 with
+# scripts/install_decoder.sh; upstream still pins pycapnp==1.1.0.
+fasm==0.0.2.post88
+prjxray @ git+https://github.com/f4pga/prjxray.git@c9f02d8576042325425824647ab5555b1bc77833
+fasm2bels @ git+https://github.com/chipsalliance/f4pga-xc-fasm2bels.git@bafbcd8727e0807d6a620d1cf5dd151111c4a322
+rr-graph @ git+https://github.com/chipsalliance/f4pga-rr-graph.git@b8f0ebb6fd9842ae8bb7ff51a0adc5f76a853802
+python-fpga-interchange @ git+https://github.com/chipsalliance/python-fpga-interchange.git@04a02101d1f7f03a2d33716192fb478e1e8605af

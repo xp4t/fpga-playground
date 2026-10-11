@@ -27,7 +27,7 @@ class OriginTests(unittest.TestCase):
     def post_board(self, origin, allowed=""):
         payload = b'{"board":"basys3"}'
         headers = ["POST /api/board HTTP/1.1", "Host: backend.example.com",
-                   "Content-Type: application/json", f"Content-Length: {len(payload)}"]
+                   "Content-Type: application/json", f"Content-Length: {len(payload)}", "X-Backend-Secret: test-secret"]
         if origin is not None:
             headers.append(f"Origin: {origin}")
         request = ("\r\n".join(headers) + "\r\n\r\n").encode() + payload
@@ -38,7 +38,7 @@ class OriginTests(unittest.TestCase):
         def acquire(*args, **kwargs):
             yield lab, None
         with mock.patch.object(server, "SESSIONS", SimpleNamespace(acquire=acquire)), mock.patch.dict(
-                server.os.environ, {"ALLOWED_ORIGINS": allowed}):
+                server.os.environ, {"ALLOWED_ORIGINS": allowed, "BACKEND_SECRET": "test-secret"}):
             server.Handler(connection, ("127.0.0.1", 12345), SimpleNamespace())
         header, body = bytes(connection.response).split(b"\r\n\r\n", 1)
         status = int(header.split(b" ", 2)[1])

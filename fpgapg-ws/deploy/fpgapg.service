@@ -1,0 +1,30 @@
+[Unit]
+Description=FPGA Playground API and build worker
+After=network.target
+
+[Service]
+Type=simple
+User=fpgapg
+Group=fpgapg
+WorkingDirectory=/srv/fpgapg-ws
+EnvironmentFile=/etc/fpgapg/backend.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/srv/fpgapg-ws/.venv/bin/python /srv/fpgapg-ws/server.py --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+CPUQuota=300%
+MemoryMax=10G
+MemorySwapMax=0
+TasksMax=128
+TemporaryFileSystem=/srv/fpgapg-ws/.work:rw,size=2G,mode=0700,uid=10001,gid=10001
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/fpgapg-ws/.work
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

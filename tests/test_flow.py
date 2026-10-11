@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 import server
+from support import SANDBOX_AVAILABLE
 
 
 class LocalResourceTests(unittest.TestCase):
@@ -32,8 +33,8 @@ class LocalResourceTests(unittest.TestCase):
                 self.assertEqual(pipeline.database_root(), Path(directory))
 
 
-@unittest.skipUnless(all(shutil.which(name) for name in ("yosys", "iverilog", "vvp")),
-                     "Yosys and Icarus Verilog are required")
+@unittest.skipUnless(SANDBOX_AVAILABLE and all(shutil.which(name) for name in ("yosys", "iverilog", "vvp")),
+                     "Working Bubblewrap, Yosys and Icarus Verilog are required")
 class FlowTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()
@@ -152,7 +153,7 @@ class FlowTests(unittest.TestCase):
                 self.lab.synthesize(server.DEFAULT_CODE, "counter", hz)
 
 
-@unittest.skipUnless(all(server.openxc7_paths(board) for board in server.BOARDS) and
+@unittest.skipUnless(SANDBOX_AVAILABLE and all(server.openxc7_paths(board) for board in server.BOARDS) and
                      all(shutil.which(name) for name in
                      ("yosys", "iverilog", "vvp")), "Open XC7 Basys3 toolchain is required")
 class OpenXC7FlowTests(unittest.TestCase):

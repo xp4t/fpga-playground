@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <meta name="theme-color" content="#f4f5f2">
+  <title>503 · FPGA server unavailable</title>
+  <link rel="stylesheet" href="/style.css">
+  <script src="/availability.js" defer></script>
+</head>
+<body class="unavailable-page">
+  <header class="topbar"><a class="brand" href="/"><strong>FPGA Workbench</strong></a></header>
+  <main class="unavailable-content">
+    <p class="unavailable-code">503 · SERVICE UNAVAILABLE</p>
+    <h1>The FPGA server is offline</h1>
+    <p>The computer running the FPGA tools is turned off or temporarily unreachable. The workbench will return when it reconnects.</p>
+    <button class="button button-primary" id="retry-connection" type="button">Try again</button>
+    <p class="unavailable-status" id="connection-status" role="status">Checking automatically every 30 seconds.</p>
+    <noscript><p>JavaScript is disabled. <a href="/">Reload the workbench</a> to try again.</p></noscript>
+  </main>
+</body>
+</html>

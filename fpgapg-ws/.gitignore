@@ -1,0 +1,52 @@
+# Local workbench output and installed toolchain
+.work/
+.tools/
+.aws/
+
+# Python and test artifacts
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# JavaScript dependencies and test output
+node_modules/
+.vercel/
+test-results/
+
+# FPGA builds and simulation output
+build/
+dist/
+obj_dir/
+.Xil/
+*.runs/
+*.cache/
+*.gen/
+*.sim/
+*.hw/
+*.ip_user_files/
+*.bit
+*.dcp
+*.fasm
+*.frames
+*.vvp
+*.vcd
+*.fst
+*.wdb
+*.jou
+*.log
+*.rpt
+
+# Editor and OS temporary files
+*.swp
+*~
+.DS_Store
+.env*
+
+# Local agent skills and hooks (already tracked files remain tracked)
+.agents/
+.codex/
+.venv-decoder/

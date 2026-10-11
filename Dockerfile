@@ -2,12 +2,12 @@
 FROM python:3.11-slim-bookworm
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends yosys iverilog bubblewrap \
+    && apt-get install -y --no-install-recommends yosys iverilog bubblewrap util-linux \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --create-home --uid 10001 workbench
 
 WORKDIR /app
-COPY server.py ./
+COPY server.py build_runner.py ./
 COPY boards/ ./boards/
 COPY sim-core/ ./sim-core/
 COPY bitstream-decode/ ./bitstream-decode/

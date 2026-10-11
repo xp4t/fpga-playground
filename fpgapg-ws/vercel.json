@@ -1,0 +1,17 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "installCommand": "",
+  "buildCommand": "mkdir -p dist && cp -r web/. dist/ && cp artya7.png nexysa7.avif dist/",
+  "outputDirectory": "dist",
+  "functions": {
+    "api/availability.js": {"maxDuration": 10},
+    "api/proxy.js": {"maxDuration": 15}
+  },
+  "rewrites": [
+    {"source": "/healthz", "destination": "/api/availability"},
+    {"source": "/api/availability", "destination": "/api/availability"},
+    {"source": "/api/proxy", "destination": "/api/proxy"},
+    {"source": "/api/:path*", "destination": "/api/proxy?route=/api/:path*"}
+  ]
+}

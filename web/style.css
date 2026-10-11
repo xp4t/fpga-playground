@@ -380,3 +380,12 @@ h1, h2, h3, p { margin: 0; }
   .dialog-switches { gap: 4px; }
   .dialog-switch { height: 43px; }
 }
+
+.panel-tabs button.tab { border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: transparent; color: inherit; font: 600 12px var(--mono); cursor: pointer; }
+.panel-tabs button.tab.active { border-bottom-color: #80b6ea; }
+#source-pane, #testbench-pane { display: flex; flex: 1; flex-direction: column; min-height: 0; }
+#testbench-pane .editor-footer { padding-block: 10px; line-height: 1.5; }
+#testbench-pane .editor-settings { height: auto; min-height: 49px; flex-wrap: wrap; padding-block: 10px; }
+.panel-tabs button.tab:focus-visible { outline: 2px solid #80b6ea; outline-offset: -3px; }
+#testbench-editor { width: 100%; min-height: 365px; }
+#source-pane[hidden], #testbench-pane[hidden] { display: none; }

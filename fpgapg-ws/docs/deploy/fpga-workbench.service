@@ -1,0 +1,31 @@
+# Use a dedicated account with uid/gid 10001 and install the checkout in /srv.
+[Unit]
+Description=FPGA Workbench build worker and API
+After=network.target
+
+[Service]
+Type=simple
+User=fpga-workbench
+Group=fpga-workbench
+WorkingDirectory=/srv/fpga-workbench
+EnvironmentFile=/etc/fpga-workbench/backend.env
+ExecStart=/usr/bin/python3.11 /srv/fpga-workbench/server.py --host 127.0.0.1 --port 8000
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+CPUQuota=150%
+MemoryMax=6G
+MemorySwapMax=0
+TasksMax=128
+# A hard aggregate disk ceiling, including all sessions and temporary tool files.
+# This ephemeral mount disappears on service restart. Session cookies then expire.
+TemporaryFileSystem=/srv/fpga-workbench/.work:rw,size=2G,mode=0700,uid=10001,gid=10001
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/fpga-workbench/.work
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

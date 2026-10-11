@@ -1,0 +1,2 @@
+# Core server uses only the Python 3.11+ standard library.
+# Optional decoder dependencies live in requirements-decoder.txt.

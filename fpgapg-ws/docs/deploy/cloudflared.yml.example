@@ -1,0 +1,7 @@
+# Replace the tunnel UUID, hostname, and credential path before installing.
+tunnel: YOUR-TUNNEL-UUID
+credentials-file: /etc/cloudflared/YOUR-TUNNEL-UUID.json
+ingress:
+  - hostname: fpga-api.example.com
+    service: http://127.0.0.1:8000
+  - service: http_status:404

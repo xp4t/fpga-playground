@@ -1,0 +1,38 @@
+name: Tests
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install RTL tools and isolation
+        run: sudo apt-get update && sudo apt-get install -y yosys iverilog bubblewrap util-linux
+      - name: Require a working sandbox
+        run: bwrap --unshare-all --ro-bind / / -- /bin/true
+      - name: Python tests (including RTL and workspace isolation)
+        run: python -m unittest discover -s tests -v
+      - name: Node API, proxy, offline, and polling tests
+        run: node --test tests/*.cjs
+  decoder-install:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install decoder build dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential cmake pkg-config
+      - name: Verify optional decoder installation on supported Python
+        env:
+          PYTHON_BIN: python
+        run: bash scripts/install_decoder.sh

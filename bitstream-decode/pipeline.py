@@ -13,7 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def database_root():
+def database_root(part="xc7a35tcpg236-1"):
     """Locate the Artix-7 database supplied by the open XC7 installation."""
     configured = os.environ.get("PRJXRAY_DB_ROOT")
     candidates = ([Path(configured)] if configured else [
@@ -22,11 +22,11 @@ def database_root():
         Path.home() / ".apio/packages/openxc7/share/nextpnr/external/prjxray-db/artix7",
     ])
     for candidate in candidates:
-        if (candidate / "xc7a35tcpg236-1/part.json").is_file() and (
-                candidate / "xc7a35tcpg236-1/package_pins.csv").is_file():
+        if (candidate / part / "part.json").is_file() and (
+                candidate / part / "package_pins.csv").is_file():
             return candidate.resolve()
     raise FileNotFoundError(
-        "Basys 3 decoder needs the Artix-7 Project X-Ray database. "
+        f"Decoder needs the Project X-Ray database for {part}. "
         "Run scripts/install_openxc7.sh or set PRJXRAY_DB_ROOT")
 
 
@@ -46,33 +46,27 @@ def run_stage(label, command, cwd, output, timeout):
             raise RuntimeError(detail) from error
 
 
-def convert(input_path, output_path):
+def convert(input_path, output_path, part="xc7a35tcpg236-1", connection_database=None, db_root=None, yosys_bin="yosys"):
     source, output = Path(input_path).resolve(), Path(output_path).resolve()
     output.mkdir(parents=True, exist_ok=True)
-    database = database_root()
-    connection_database = ROOT / "build/xc7a35t.db"
-    connection_database.parent.mkdir(parents=True, exist_ok=True)
-    complete_marker = connection_database.with_suffix(".complete")
-    if not (connection_database.is_file() and complete_marker.is_file()):
-        # fasm2bels skips any existing database, including one left by an
-        # interrupted build. Recreate an unmarked cache on the next run.
-        connection_database.unlink(missing_ok=True)
-        complete_marker.unlink(missing_ok=True)
+    database = Path(db_root) if db_root else database_root(part)
+    # Public builds consume a prebuilt read-only cache; never write shared host data.
+    connection_database = Path(connection_database) if connection_database else ROOT / ".tools/decoder" / f"{part}.db"
+    if not connection_database.is_file():
+        raise FileNotFoundError(f"Prepare the trusted decoder cache for {part}; see docs/DEPLOY.md")
     for label, command in [
         ("decode", [sys.executable, str(ROOT / "bitstream-decode/decode.py"), str(source),
-                    "--output", str(output / "design.fasm"), "--db-root", str(database)]),
+                    "--output", str(output / "design.fasm"), "--db-root", str(database), "--part", part]),
         ("fasm2bels", [sys.executable, "-m", "fasm2bels", "--connection_database", str(connection_database),
-                        "--db_root", str(database), "--part", "xc7a35tcpg236-1",
+                        "--db_root", str(database), "--part", part,
                         "--fasm_file", str(output / "design.fasm"),
                         "--verilog_file", str(output / "decoded.v"),
                         "--xdc_file", str(output / "decoded.xdc"), "--iostandard", "LVCMOS33", "--drive", "12"]),
     ]:
         run_stage(label, command, ROOT, output, timeout=600)
-        if label == "fasm2bels":
-            complete_marker.touch()
     # Fixed filenames in a controlled working directory avoid Yosys command injection.
     command = "read_verilog -lib -nowb +/xilinx/cells_sim.v; read_verilog decoded.v; hierarchy -top top; write_json netlist.json"
-    run_stage("yosys", ["yosys", "-Q", "-T", "-p", command], output, output,
+    run_stage("yosys", [yosys_bin, "-Q", "-T", "-p", command], output, output,
               timeout=60)
     return output / "netlist.json"
 
@@ -81,5 +75,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input")
     parser.add_argument("--output", default="build/decoded")
+    parser.add_argument("--part", default="xc7a35tcpg236-1")
+    parser.add_argument("--db-root")
+    parser.add_argument("--connection-database")
+    parser.add_argument("--yosys", default="yosys")
     args = parser.parse_args()
-    print(convert(args.input, args.output))
+    print(convert(args.input, args.output, args.part, args.connection_database, args.db_root, args.yosys))

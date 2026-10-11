@@ -10,6 +10,7 @@ let topAuto = true;
 let clockSelectionHz = 100000000;
 let backendOffline = false;
 let checkingBackend = false;
+let pollingJob = null;
 
 async function checkBackend() {
   if (checkingBackend) return;
@@ -26,10 +27,16 @@ async function checkBackend() {
     clearInterval(timer);
     timer = null;
     $('build-status').textContent = 'Server offline';
+    if (!state) {
+      $('tool-summary').textContent = 'Offline editor · drafts saved in this browser';
+      $('build-log').textContent = 'The build server is offline. Keep editing or download your source. Builds resume when the server reconnects.';
+      $('fabric-note').textContent = 'Connect to the build server to simulate this design.';
+    }
   } finally {
     $('backend-offline').hidden = !backendOffline;
     $('retry-backend').disabled = false;
     checkingBackend = false;
+    if (state && !busy) render();
     renderControls();
   }
 }
@@ -180,7 +187,7 @@ async function requestJSON(path, options) {
   } catch {
     throw new Error(`FPGA backend returned invalid JSON (HTTP ${response.status}). Check the backend service logs.`);
   }
-  if (!response.ok) throw new Error(data.error || 'Request failed');
+  if (!response.ok) { const error = new Error(data.error || 'Request failed'); error.status = response.status; throw error; }
   return data;
 }
 
@@ -188,22 +195,59 @@ async function api(path, payload) {
   return requestJSON(path, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
 }
 
+async function monitorJob(job) {
+  if (pollingJob) return pollingJob;
+  busy = true;
+  running = false;
+  clearInterval(timer);
+  renderControls();
+  const monitor = (async () => {
+    try {
+      while (['queued', 'running'].includes(job.status)) {
+        $('build-status').textContent = job.status === 'queued'
+          ? `Build queued · position ${job.queuePosition || 1}` : `Building · ${job.elapsedSeconds}s`;
+        $('build-log').textContent = job.log || 'Waiting for worker…';
+        await new Promise(resolve => setTimeout(resolve, 1500));
+        try {
+          job = await requestJSON(`/api/jobs/${encodeURIComponent(job.jobId)}`, {signal: AbortSignal.timeout(7000)});
+          backendOffline = false;
+          $('backend-offline').hidden = true;
+        } catch (error) {
+          if ([401, 403, 404].includes(error.status)) throw error;
+          backendOffline = true;
+          $('backend-offline').hidden = false;
+          $('build-status').textContent = 'Connection lost · build may still be running';
+          await new Promise(resolve => setTimeout(resolve, 5000));
+        }
+      }
+      if (job.result) { state = job.result; render(); }
+      if (job.status === 'failed') throw new Error(job.error || 'Build failed');
+      return state;
+    } finally {
+      busy = false;
+      renderControls();
+    }
+  })();
+  pollingJob = monitor;
+  try { return await monitor; } finally { if (pollingJob === monitor) pollingJob = null; }
+}
+
 async function action(path, payload) {
   if (busy || backendOffline) return false;
   busy = true;
   renderControls();
-  const progress = {'/api/synthesize':'Synthesizing Verilog…','/api/implement':'Placing, routing, and preparing board…','/api/bitstream':'Generating Artix-7 bitstream…'}[path];
-  if (progress) { $('build-status').textContent = progress; $('build-log').textContent = progress + '\nThe tool result will appear here when it finishes.'; }
   try {
-    const result = await api(path, payload);
+    let result = await api(path, payload);
+    if (result.jobId) result = await monitorJob(result);
     state = result;
-    if (path === '/api/synthesize') { $('top-module').value = result.top; topAuto = true; }
+    if (path === '/api/synthesize' && $('editor').value === payload.code) {
+      $('top-module').value = result.top; topAuto = true;
+    }
     render();
     return true;
   } catch (error) {
     showNotice(error.message);
     $('build-log').textContent = error.message;
-    try { state = await requestJSON('/api/status'); render(); } catch {}
     return false;
   } finally {
     busy = false;
@@ -261,6 +305,7 @@ function renderControls() {
   const synthesized = ['synthesized','preview','implemented','bitstream'].includes(state?.phase);
   $('board-select').disabled = unavailable;
   $('synthesize-button').disabled = unavailable;
+  $('testbench-run').disabled = unavailable;
   $('implement-button').disabled = unavailable || !synthesized || sourceDirty;
   $('bitstream-button').disabled = unavailable || !['implemented','bitstream'].includes(state?.phase) || sourceDirty;
   $('run-button').disabled = unavailable || !state?.preview;
@@ -297,12 +342,12 @@ function renderBoard() {
   const boardStatus = state.fabricStatus === 'ready' ? 'BITSTREAM FABRIC' :
     state.fabricStatus === 'decoding' ? 'DECODING BITSTREAM' :
     state.fabricStatus === 'error' ? 'RTL PREVIEW · DECODER ERROR' :
-    state.phase === 'bitstream' && (state.board !== 'basys3' || state.clockHz !== 100000000) ? 'BITSTREAM READY · RTL VIEW' :
+    state.phase === 'bitstream' && state.clockHz !== 100000000 ? 'BITSTREAM READY · RTL VIEW' :
     state.preview ? 'RTL PREVIEW' : 'AWAITING DESIGN';
   $('board-status').textContent = boardStatus;
   $('board-status').classList.toggle('live', Boolean(state.preview));
-  if (state.phase === 'bitstream' && state.board !== 'basys3')
-    $('fabric-note').textContent = 'Bitstream ready. LEDs and waveform show RTL simulation; fabric decoding is available for Basys 3.';
+  if (state.phase === 'bitstream' && state.fabricStatus !== 'ready' && state.clockHz === 100000000)
+    $('fabric-note').textContent = 'Bitstream ready. LEDs and waveform show RTL simulation; check the build log for decoder setup or unsupported blocks.';
   else if (state.phase === 'bitstream' && state.clockHz !== 100000000)
     $('fabric-note').textContent = 'Bitstream ready. LEDs and waveform show selected clock cycles in RTL preview.';
   else if (state.fabricError) $('fabric-note').textContent = `Fabric decoder: ${state.fabricError}`;
@@ -384,7 +429,7 @@ function renderWaveform() {
 }
 
 function renderArtifacts() {
-  const labels = {'design.v':'Verilog source','adapter.v':'Generated board adapter','clock_adapter.v':'Generated clock divider','board.xdc':'Board pin constraints','netlist.json':'Synthesized netlist',
+  const labels = {'design.v':'Verilog source','user_design.v':'Testbench design source','testbench.v':'Custom testbench','testbench.vcd':'Testbench waveform','adapter.v':'Generated board adapter','clock_adapter.v':'Generated clock divider','board.xdc':'Board pin constraints','netlist.json':'Synthesized netlist',
     'xc7_netlist.json':'Artix-7 mapped netlist','routed.json':'Placed and routed design','design.fasm':'FPGA feature map',
     'design.frames':'Configuration frames','route.log':'Place and route log',
     'synth.rpt':'Synthesis report','timing.rpt':'Timing report','routed.dcp':'Routed checkpoint','design.bit':'FPGA bitstream'};
@@ -408,7 +453,7 @@ function render() {
   renderWaveform();
   renderArtifacts();
   $('build-log').textContent = state.log || 'Ready.';
-  $('tool-summary').textContent = state.tools.vivado ? 'Vivado connected · bitstream available' :
+  $('tool-summary').textContent = backendOffline ? 'Offline editor · drafts saved in this browser' : state.tools.vivado ? 'Vivado connected · bitstream available' :
     state.tools.openxc7 ? 'Open XC7 connected · bitstream available' : 'Yosys + Icarus preview · install open XC7 for .bit';
   $('tool-summary').title = state.tools.vivado ? 'Vivado detected on this server' :
     state.tools.openxc7 ? 'Yosys, nextpnr-xilinx, and Project X-Ray are ready' : `Install the open XC7 database for ${state.part} to place, route, and generate a bitstream`;
@@ -475,8 +520,9 @@ function setupEditor() {
   $('top-module').addEventListener('input', () => { topAuto=false; sourceDirty=true; renderControls(); });
   $('synthesize-button').addEventListener('click', async () => {
     stopRun();
-    const success=await action('/api/synthesize', {code:$('editor').value, top:$('top-module').value.trim(), clockHz:clockSelectionHz});
-    if (success) { sourceDirty=false; renderControls(); showNotice('Synthesis completed. Choose switches for implementation.', 'success'); }
+    const submittedCode = $('editor').value;
+    const success=await action('/api/synthesize', {code:submittedCode, top:$('top-module').value.trim(), clockHz:clockSelectionHz});
+    if (success) { sourceDirty=$('editor').value !== submittedCode || clockSelectionHz !== state.clockHz; renderControls(); showNotice('Synthesis completed. Choose switches for implementation.', 'success'); }
   });
   $('implement-button').addEventListener('click', () => {
     if (state?.tools.vivado) $('implement-mode').textContent = 'Vivado will place and route the design. Your switch word sets the initial virtual board inputs.';
@@ -512,6 +558,34 @@ function setupEditor() {
   });
   $('run-button').addEventListener('click', toggleRun);
   $('step-button').addEventListener('click', () => control({step:1}));
+  for (const name of ['source', 'testbench']) {
+    $(`${name}-tab`).addEventListener('click', () => {
+      $('source-pane').hidden = name !== 'source';
+      $('testbench-pane').hidden = name !== 'testbench';
+      for (const tab of ['source', 'testbench']) {
+        $(`${tab}-tab`).classList.toggle('active', tab === name);
+        $(`${tab}-tab`).setAttribute('aria-selected', String(tab === name));
+        $(`${tab}-tab`).tabIndex = tab === name ? 0 : -1;
+      }
+    });
+  }
+  for (const name of ['source', 'testbench']) {
+    $(`${name}-tab`).addEventListener('keydown', event => {
+      if (['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) {
+        event.preventDefault();
+        const target = event.key === 'Home' ? 'source' : event.key === 'End' ? 'testbench' : name === 'source' ? 'testbench' : 'source';
+        $(`${target}-tab`).click();
+        $(`${target}-tab`).focus();
+      }
+    });
+  }
+  $('testbench-editor').addEventListener('input' , () => {
+    try { localStorage.setItem('fpga-workbench-testbench-v1', $('testbench-editor').value); } catch {}
+  });
+  $('testbench-run').addEventListener('click', async () => {
+    if (await action('/api/testbench', {code: $('editor').value, testbench: $('testbench-editor').value,
+      top: $('testbench-top').value.trim()})) showNotice('Testbench completed. See output and download its VCD from Artifacts.', 'success');
+  });
   $('download-source').addEventListener('click', () => {
     const blob=new Blob([$('editor').value], {type:'text/plain'});
     const link=document.createElement('a'); link.href=URL.createObjectURL(blob); link.download=`${$('top-module').value.trim()||'design'}.v`; link.click();
@@ -553,9 +627,19 @@ async function loadWorkbench(preserveEditor = false) {
   sourceDirty=$('editor').value!==source.code || clockSelectionHz !== state.clockHz;
   updateLines();
   render();
+  if (status.job && !pollingJob) monitorJob(status.job).catch(error => showNotice(error.message));
 }
 
 async function init() {
+  // Populate the editor before any network call, so first-time offline visits work.
+  try {
+    $('editor').value = localStorage.getItem('fpga-workbench-private-code-v1') || $('editor').value;
+    $('testbench-editor').value = localStorage.getItem('fpga-workbench-testbench-v1') || $('testbench-editor').value;
+  } catch {}
+  updateLines();
+  suggestTop();
+  backendOffline = true;
+  renderControls();
   setupEditor();
   $('retry-backend').addEventListener('click', checkBackend);
   setInterval(checkBackend, 30000);
@@ -568,10 +652,13 @@ async function init() {
     await control({button:'btnC',value:false});
   });
   setInterval(async () => {
-    if (busy || backendOffline || running || !state?.fabricStatus || state.fabricStatus==='error') return;
-    try { state=await requestJSON('/api/status'); render(); } catch {}
-  }, 900);
-  await loadWorkbench();
+    if (busy || backendOffline || running || !state) return;
+    try {
+      state = await requestJSON('/api/status'); render();
+      if (state.job) monitorJob(state.job).catch(error => showNotice(error.message));
+    } catch {}
+  }, 3000);
+  await checkBackend();
 }
 
 init().catch(error => {

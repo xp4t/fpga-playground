@@ -18,8 +18,15 @@ LOG = logging.getLogger("runtime")
 
 
 class BoardRuntime:
-    def __init__(self, program_root=None):
+    def __init__(self, program_root=None, *, part="xc7a35tcpg236-1", master_xdc=None,
+                 switch_count=16, led_count=16, buttons=None, converter=None, db_root=None,
+                 button_ports=None):
         self.program_root = Path(program_root) if program_root is not None else ROOT / "build/programs"
+        self.part = part
+        self.master_xdc = Path(master_xdc) if master_xdc else ROOT / "boards/Basys-3-Master.xdc"
+        self.switch_count, self.led_count = switch_count, led_count
+        self.converter, self.db_root = converter, db_root
+        self.button_ports = button_ports or {}
         self.lock = threading.RLock()
         self.stop_event = threading.Event()
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="decode")
@@ -31,8 +38,8 @@ class BoardRuntime:
         self.analyzer = None
         self.running = False
         self.rate = 32
-        self.switches = [0] * 16
-        self.buttons = {name: 0 for name in ("btnC", "btnU", "btnD", "btnL", "btnR")}
+        self.switches = [0] * switch_count
+        self.buttons = {name: 0 for name in (buttons if buttons is not None else ("btnC", "btnU", "btnD", "btnL", "btnR"))}
         self.connected = lambda: False
         self.endpoint = "127.0.0.1:2542"
         self.source_hash = None
@@ -47,12 +54,15 @@ class BoardRuntime:
             self.status = "programming"
             self.error = None
 
-    def programmed(self, data):
+    def programmed(self, data, synchronous=False):
         with self.lock:
             self.generation += 1
             generation = self.generation
             self.status = "decoding"
-        self.executor.submit(self.load_program, bytes(data), generation)
+        if synchronous:
+            self.load_program(bytes(data), generation)
+        else:
+            self.executor.submit(self.load_program, bytes(data), generation)
 
     def load_program(self, data, generation):
         try:
@@ -64,14 +74,14 @@ class BoardRuntime:
             capture.write_bytes(data)
             netlist = output / "netlist.json"
             if not netlist.exists():
-                netlist = convert(capture, output)
+                netlist = self.converter(capture, output) if self.converter else convert(capture, output, part=self.part)
             report = json.loads((output / "design.decode.json").read_text())
             if report["unknown_bits"] or report["missing_tile_types"] or not report["complete"]:
                 raise ValueError("Configuration has unknown bits or incomplete database coverage; see decode report")
             simulator = Simulator.load(netlist)
             board = BoardPins(simulator,
-                              database_root() / "xc7a35tcpg236-1/package_pins.csv",
-                              ROOT / "boards/Basys-3-Master.xdc")
+                              (self.db_root or database_root(self.part)) / self.part / "package_pins.csv",
+                              self.master_xdc, led_count=self.led_count)
             with self.lock:
                 if generation != self.generation:
                     return
@@ -98,7 +108,7 @@ class BoardRuntime:
 
     def apply_inputs(self):
         if self.board:
-            self.board.drive({**{f"sw[{i}]": value for i, value in enumerate(self.switches)}, **self.buttons})
+            self.board.drive({**{f"sw[{i}]": value for i, value in enumerate(self.switches)}, **{self.button_ports.get(name, name): value for name, value in self.buttons.items()}})
 
     def control(self, command):
         if not isinstance(command, dict):
@@ -110,15 +120,15 @@ class BoardRuntime:
             input_changed = False
             if "switches" in command:
                 word = command["switches"]
-                if "switch" in command or type(word) is not int or not 0 <= word <= 0xFFFF:
-                    raise ValueError("Switches must be a 16-bit word, without an individual switch update")
-                updated = [(word >> index) & 1 for index in range(16)]
+                if "switch" in command or type(word) is not int or not 0 <= word < (1 << self.switch_count):
+                    raise ValueError("Switch word exceeds board width, without an individual switch update")
+                updated = [(word >> index) & 1 for index in range(self.switch_count)]
                 input_changed |= updated != self.switches
                 self.switches = updated
             if "switch" in command:
                 index = command["switch"]
-                if type(index) is not int or not 0 <= index < 16 or type(command.get("value")) is not bool:
-                    raise ValueError("Switch requires index 0–15 and boolean value")
+                if type(index) is not int or not 0 <= index < self.switch_count or type(command.get("value")) is not bool:
+                    raise ValueError("Switch index must fit the board and value must be boolean")
                 updated = int(command["value"])
                 input_changed |= updated != self.switches[index]
                 self.switches[index] = updated
@@ -194,12 +204,12 @@ class BoardRuntime:
         with self.lock:
             return {"status": self.status, "error": self.error, "running": self.running,
                     "rate": self.rate, "switches": list(self.switches), "buttons": dict(self.buttons),
-                    "leds": [self.board.read(f"led[{i}]") if self.board else None for i in range(16)],
+                    "leds": [self.board.read(f"led[{i}]") if self.board else None for i in range(self.led_count)],
                     "cycles": self.board.simulator.steps if self.board else 0,
                     "cells": len(self.board.simulator.cells) if self.board else 0,
                     "clocked": "clk" in self.board.ports if self.board else None,
                     "xvc_connected": self.connected(), "endpoint": self.endpoint,
-                    "part": "xc7a35t", "sha256": self.source_hash}
+                    "part": self.part, "sha256": self.source_hash}
 
     def run(self):
         previous = time.monotonic()

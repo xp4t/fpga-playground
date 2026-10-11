@@ -18,7 +18,7 @@
   </header>
 
   <section id="backend-offline" class="offline-banner" role="status" hidden>
-    <div><strong>503 · FPGA server unavailable</strong><p>The server computer is offline or unreachable. You can keep editing. Checking again every 30 seconds.</p></div>
+    <div><strong>Build server offline</strong><p>The build server is unreachable. Edit and download Verilog here; builds resume when it reconnects. Checking again every 30 seconds.</p></div>
     <button id="retry-backend" type="button" class="button">Try again</button>
   </section>
   <div class="shell">
@@ -56,10 +56,46 @@
 
       <main class="workspace">
         <section class="panel code-panel" aria-label="Verilog editor">
-          <div class="panel-tabs"><span class="tab active"><span class="tab-icon">◇</span> design.v</span><span class="tab-meta">VERILOG SOURCE</span></div>
+          <div class="panel-tabs" role="tablist" aria-label="Code files"><button type="button" id="source-tab" class="tab active" role="tab" aria-selected="true" aria-controls="source-pane">design.v</button><button type="button" id="testbench-tab" class="tab" role="tab" tabindex="-1" aria-selected="false" aria-controls="testbench-pane">Testbench</button><span class="tab-meta">VERILOG</span></div>
+          <div id="source-pane" role="tabpanel" aria-labelledby="source-tab">
           <div class="editor-settings"><label for="top-module">Top module</label><input id="top-module" spellcheck="false" value="counter" aria-label="Top module name"><span class="editor-tip">Detected from your source · Ctrl/⌘ Enter to synthesize</span></div>
-          <div class="code-area"><pre id="line-numbers" aria-hidden="true">1</pre><textarea id="editor" aria-label="Verilog source code" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off"></textarea></div>
+          <div class="code-area"><pre id="line-numbers" aria-hidden="true">1</pre><textarea id="editor" aria-label="Verilog source code" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off">`timescale 1ns/1ps
+module counter (
+    input wire clk,
+    input wire btnC,
+    input wire [15:0] sw,
+    output wire [15:0] led
+);
+    reg [7:0] count = 0;
+    always @(posedge clk) begin
+        if (btnC) count &lt;= 0;
+        else if (sw[0]) count &lt;= count + 1'b1;
+    end
+    assign led = {8'b0, count};
+endmodule
+</textarea></div>
           <div class="editor-footer"><span><span class="footer-dot"></span><span id="editor-state">Saved in this browser</span></span><span>UTF-8 <span class="footer-separator">·</span> <span id="editor-lines">1 line</span></span><button id="download-source" type="button" title="Download source Verilog">↓ Source</button></div>
+          </div>
+          <div id="testbench-pane" role="tabpanel" aria-labelledby="testbench-tab" hidden>
+            <div class="editor-settings"><label for="testbench-top">Testbench module</label><input id="testbench-top" spellcheck="false" value="tb"><button type="button" id="testbench-run" class="button button-secondary" disabled>Run testbench</button></div>
+            <div class="code-area"><textarea id="testbench-editor" aria-label="Icarus Verilog testbench" spellcheck="false" autocapitalize="off">`timescale 1ns/1ps
+module tb;
+    reg clk = 0, btnC = 0;
+    reg [15:0] sw = 1;
+    wire [15:0] led;
+    counter uut (.clk(clk), .btnC(btnC), .sw(sw), .led(led));
+    always #5 clk = ~clk;
+    initial begin
+        $dumpfile("testbench.vcd");
+        $dumpvars(0, tb);
+        #100;
+        $display("LED = %h", led);
+        $finish;
+    end
+endmodule
+</textarea></div>
+            <div class="editor-footer">Runs your design.v with Icarus. Use $finish and $dumpfile("testbench.vcd") to capture a waveform.</div>
+          </div>
         </section>
 
         <section class="panel board-panel" aria-label="Virtual FPGA board">

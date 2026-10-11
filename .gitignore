@@ -45,3 +45,8 @@ obj_dir/
 *~
 .DS_Store
 .env*
+
+# Local agent skills and hooks (already tracked files remain tracked)
+.agents/
+.codex/
+.venv-decoder/
